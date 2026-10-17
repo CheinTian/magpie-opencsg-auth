@@ -1,4 +1,4 @@
-// OpenCSG AI Gateway as an OpenCode / magpie provider.
+// OpenCSG AI Gateway as a magpie provider.
 //
 // OpenCSG's gateway is OpenAI-compatible. API keys created in the platform
 // (they start with "gw-sk-") are sent as Bearer tokens; models and their

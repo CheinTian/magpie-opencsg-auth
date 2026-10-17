@@ -1,6 +1,6 @@
-# opencode-opencsg-auth
+# magpie-opencsg-auth
 
-OpenCSG AI Gateway as an OpenCode / magpie provider.
+OpenCSG AI Gateway provider for magpie.
 
 Provider id: `opencsg`.
 
@@ -24,7 +24,7 @@ Provider id: `opencsg`.
 From this folder:
 
 ```sh
-magpie plugin add ./opencode-opencsg-auth
+magpie plugin add ./magpie-opencsg-auth
 magpie plugin
 magpie plugin login opencsg oauth
 magpie provider test opencsg
@@ -34,8 +34,8 @@ The public model catalog can be read before signing in. After sign-in the
 account's own catalog is used, including models available through its
 organization.
 
-For OpenCode, add the folder or npm package to `opencode.json` under
-`plugin`, then run `/connect` and choose OpenCSG.
+The plugin uses magpie's OpenCode-compatible provider interface, but its
+sign-in and model hooks are designed and tested for magpie.
 
 ## Sign-in
 
