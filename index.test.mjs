@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test"
 
-import { _internal } from "./index.mjs"
+import OpenCodePlugin, { _internal } from "./index.mjs"
 
 const realFetch = globalThis.fetch
 
@@ -450,7 +450,7 @@ describe("plugin hooks", () => {
 
     expect(request.input).toBe("https://private.example/v1/chat/completions")
     expect(request.init.headers.get("authorization")).toBe("Bearer gw-sk-test")
-    expect(request.init.headers.get("x-opencsg-client")).toBe("opencsg-magpie/0.1.0")
+    expect(request.init.headers.get("x-opencsg-client")).toBe("opencsg-magpie/0.1.1")
     expect(request.init.headers.get("content-length")).toBeNull()
     expect(request.init.signal).toBe(signal)
     expect(res.headers.get("x-magpie-sign-in")).toBe("expired")
@@ -462,5 +462,266 @@ describe("plugin hooks", () => {
     const loader = await hooks.auth.loader(async () => undefined)
 
     expect(loader).toEqual({})
+  })
+})
+
+describe("OpenCode v2 plugin", () => {
+  const context = ({ connection, credential } = {}) => {
+    const state = {
+      integrations: new Map(),
+      methods: [],
+      providers: new Map(),
+      transforms: 0,
+      reloads: 0,
+    }
+    return {
+      state,
+      ctx: {
+        integration: {
+          connection: {
+            active: async () => connection,
+            resolve: async () => credential,
+          },
+          transform: async (callback) => {
+            callback({
+              update: (id, update) => {
+                const integration = state.integrations.get(id) ?? { id, name: id }
+                update(integration)
+                state.integrations.set(id, integration)
+              },
+              method: {
+                update: ({ method }) => state.methods.push(method),
+              },
+            })
+          },
+        },
+        provider: {
+          transform: async (callback) => {
+            state.transforms += 1
+            callback({
+              add: ({ info, models, sourceConnection }) =>
+                state.providers.set(info.id, { info, models, sourceConnection }),
+            })
+          },
+          reload: async () => {
+            state.reloads += 1
+          },
+        },
+        event: {
+          subscribe: () => ({
+            async *[Symbol.asyncIterator]() {
+              await new Promise(() => {})
+            },
+          }),
+        },
+      },
+    }
+  }
+
+  test("exports the OpenCode v2 definition", () => {
+    expect(OpenCodePlugin.id).toBe("magpie-opencsg-auth")
+    expect(typeof OpenCodePlugin.setup).toBe("function")
+  })
+
+  test("registers OpenCSG, key auth, OAuth, and a public model catalog", async () => {
+    globalThis.fetch = async () =>
+      Response.json(
+        modelPage([
+          {
+            id: "chat",
+            task: "text-generation",
+            support_function_call: true,
+            context_length: 128_000,
+          },
+          { id: "embed", task: "text-embedding" },
+        ]),
+      )
+
+    const { ctx, state } = context()
+    const cleanup = await OpenCodePlugin.setup(ctx)
+    await cleanup()
+
+    expect(state.integrations.get("opencsg")).toEqual({
+      id: "opencsg",
+      name: "OpenCSG",
+    })
+    expect(state.methods.map((method) => method.type)).toEqual(["key", "oauth"])
+    expect(state.methods[0]).toMatchObject({
+      label: "OpenCSG API key",
+      form: [{ key: "gateway", type: "string" }],
+    })
+    expect(state.methods[1]).toMatchObject({
+      id: "oauth",
+      label: "Sign in with OpenCSG",
+      form: [{ key: "gateway", type: "string" }],
+    })
+
+    const provider = state.providers.get("opencsg")
+    expect(provider.info).toMatchObject({
+      id: "opencsg",
+      integrationID: "opencsg",
+      name: "OpenCSG",
+      activation: "enabled",
+      package: "@opencode/ai/providers/openai-compatible",
+      settings: { baseURL: "https://opencsg.com/aigateway/v1" },
+    })
+    expect(provider.models.map((model) => model.id)).toEqual(["chat"])
+    expect(provider.models[0]).toMatchObject({
+      id: "chat",
+      modelID: "chat",
+      providerID: "opencsg",
+      name: "Chat",
+      capabilities: {
+        tools: true,
+        input: ["text"],
+        output: ["text"],
+      },
+      variants: [],
+      status: "active",
+      enabled: true,
+      limit: { context: 128_000, output: 0 },
+    })
+    expect(state.transforms).toBe(1)
+  })
+
+  test("uses account credentials and a custom gateway", async () => {
+    const connection = {
+      type: "credential",
+      id: "cred_1",
+      label: "Work",
+      method: "key",
+    }
+    const credential = {
+      type: "key",
+      key: "gw-sk-test",
+      configuration: { gateway: "https://private.example/aigateway" },
+    }
+    let request
+    globalThis.fetch = async (input, init) => {
+      request = { url: String(input), headers: new Headers(init.headers) }
+      return Response.json(modelPage([{ id: "private-chat", task: "text-generation" }]))
+    }
+
+    const { ctx, state } = context({ connection, credential })
+    const cleanup = await OpenCodePlugin.setup(ctx)
+    await cleanup()
+
+    expect(request.url).toBe("https://private.example/aigateway/v1/models?page=1&per=100")
+    expect(request.headers.get("authorization")).toBe("Bearer gw-sk-test")
+    expect(state.providers.get("opencsg").info.settings.baseURL).toBe(
+      "https://private.example/aigateway/v1",
+    )
+    expect(state.providers.get("opencsg").sourceConnection).toBe(connection)
+    expect(state.providers.get("opencsg").models.map((model) => model.id)).toEqual([
+      "private-chat",
+    ])
+    // OpenCode merges key form answers over provider/model settings. A custom
+    // `gateway` answer must not replace the normalized OpenAI-compatible base.
+    const runtime = {
+      ...state.providers.get("opencsg").info.settings,
+      ...state.providers.get("opencsg").models[0].settings,
+      ...credential.configuration,
+    }
+    expect(`${runtime.baseURL}/chat/completions`).toBe(
+      "https://private.example/aigateway/v1/chat/completions",
+    )
+  })
+
+  test("keeps the provider visible and rebases retained models when discovery fails", async () => {
+    const connection = {
+      type: "credential",
+      id: "cred_1",
+      label: "Work",
+      method: "key",
+    }
+    const credential = {
+      type: "key",
+      key: "gw-sk-test",
+      configuration: { gateway: "https://private.example/aigateway" },
+    }
+    globalThis.fetch = async () => new Response("down", { status: 503 })
+
+    const { ctx, state } = context({ connection, credential })
+    const cleanup = await OpenCodePlugin.setup(ctx)
+    await cleanup()
+
+    const provider = state.providers.get("opencsg")
+    expect(provider.info.settings.baseURL).toBe("https://private.example/aigateway/v1")
+    expect(provider.sourceConnection).toBeUndefined()
+    expect(provider.models.map((model) => model.id)).toEqual(["auto"])
+    expect(provider.models[0].settings.baseURL).toBe("https://private.example/aigateway/v1")
+  })
+
+  test("reads gateway and key from OAuth metadata", () => {
+    expect(
+      _internal.credentialAuth({
+        type: "oauth",
+        access: "gw-sk-oauth",
+        metadata: { baseURL: "https://opencsg.example/aigateway/v1" },
+      }),
+    ).toEqual({
+      key: "gw-sk-oauth",
+      baseURL: "https://opencsg.example/aigateway/v1",
+    })
+  })
+
+  test("accepts legacy baseURL key configuration", () => {
+    expect(
+      _internal.credentialAuth({
+        type: "key",
+        key: "gw-sk-legacy",
+        configuration: { baseURL: "https://legacy.example/aigateway" },
+      }),
+    ).toEqual({
+      key: "gw-sk-legacy",
+      baseURL: "https://legacy.example/aigateway/v1",
+    })
+  })
+
+  test("credential events refresh the captured catalog without adding transforms", async () => {
+    let listener
+    let credential
+    const connection = {
+      type: "credential",
+      id: "cred_1",
+      label: "Work",
+      method: "key",
+    }
+    const base = context({ connection })
+    base.ctx.event.subscribe = ({ signal }) => ({
+      async *[Symbol.asyncIterator]() {
+        listener = {
+          next: async () => {
+            if (signal.aborted) return { done: true }
+            await new Promise((resolve) => setTimeout(resolve, 5))
+            return {
+              done: false,
+              value: { type: "credential.updated", data: { integrationID: "opencsg" } },
+            }
+          },
+        }
+        while (!signal.aborted) {
+          await new Promise((resolve) => setTimeout(resolve, 5))
+          yield { type: "credential.updated", data: { integrationID: "opencsg" } }
+          await new Promise((resolve) => setTimeout(resolve, 5))
+        }
+      },
+    })
+    base.ctx.integration.connection.resolve = async () => credential
+    globalThis.fetch = async () =>
+      Response.json(modelPage([{ id: "chat", task: "text-generation" }]))
+
+    const cleanup = await OpenCodePlugin.setup(base.ctx)
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    credential = {
+      type: "key",
+      key: "gw-sk-test",
+      configuration: { gateway: "https://private.example/aigateway" },
+    }
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    await cleanup()
+
+    expect(base.state.transforms).toBe(1)
+    expect(base.state.reloads).toBeGreaterThan(1)
   })
 })

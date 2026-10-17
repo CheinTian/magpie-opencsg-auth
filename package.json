@@ -1,7 +1,7 @@
 {
   "name": "magpie-opencsg-auth",
-  "version": "0.1.0",
-  "description": "magpie provider plugin for OpenCSG AI Gateway",
+  "version": "0.1.1",
+  "description": "OpenCode and magpie provider plugin for OpenCSG AI Gateway with API key and OAuth login",
   "type": "module",
   "main": "./index.mjs",
   "exports": "./index.mjs",
@@ -12,9 +12,13 @@
   ],
   "keywords": [
     "opencode",
+    "opencode-plugin",
+    "magpie",
+    "magpie-plugin",
     "opencsg",
     "csghub",
-    "aigateway"
+    "aigateway",
+    "provider"
   ],
   "license": "MIT",
   "repository": {

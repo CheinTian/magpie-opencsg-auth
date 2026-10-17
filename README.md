@@ -1,130 +1,161 @@
 # magpie-opencsg-auth
 
-OpenCSG AI Gateway provider for magpie.
+OpenCSG AI Gateway provider for **OpenCode v2** and **magpie**.
 
-Provider id: `opencsg`.
+- Provider ID: `opencsg`
+- Plugin ID: `magpie-opencsg-auth`
+- Gateway: `https://opencsg.com/aigateway/v1`
+- Login: OpenCSG API key or browser OAuth
 
-## What it does
+## Features
 
-- Signs in with an OpenCSG API key (`gw-sk-…`) or browser OAuth.
-- Exchanges the browser login for an AI Gateway key automatically. The
+- Uses the OpenAI-compatible OpenCSG AI Gateway.
+- Discovers the signed-in account's chat models from `GET /v1/models`.
+- Supports text and image-input models, tool calls, context limits and price
+  metadata when OpenCSG publishes them.
+- Supports private CSGHub / OpenCSG deployments through a custom gateway URL.
+- Exchanges an OpenCSG browser login for an AI Gateway key automatically; the
   short-lived CSGHub JWT is not stored.
-- Uses the OpenAI-compatible AI Gateway endpoint
-  `https://opencsg.com/aigateway/v1`.
-- Discovers the account's models from `GET /v1/models`, including task,
-  tool-call, image-input and price metadata when OpenCSG publishes it.
-- Supports private CSGHub / OpenCSG deployments through a configurable
-  gateway URL.
-- Streams Chat Completions responses through unchanged.
-- Marks an account as needing sign-in again on `401` / `403`, so magpie can
-  move to another account or provider.
+- Marks credentials as expired on `401` / `403`, so OpenCode can prompt for a
+  new login.
 
-## Install
+## Use in OpenCode
 
-From this folder:
+Requires OpenCode v2.
+
+### 1. Install the plugin
 
 ```sh
-magpie plugin add ./magpie-opencsg-auth
-magpie plugin
+opencode plugin add github:CheinTian/magpie-opencsg-auth
+```
+
+This adds the plugin to the global OpenCode configuration. Alternatively, add
+it to `~/.config/opencode/opencode.json` manually:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": ["github:CheinTian/magpie-opencsg-auth"]
+}
+```
+
+Restart OpenCode if the OpenCSG provider does not appear immediately:
+
+```sh
+opencode service restart
+```
+
+### 2. Sign in
+
+Sign in with an existing API key:
+
+```sh
+opencode auth login opencsg --method key
+```
+
+Leave **Gateway URL** empty for the public OpenCSG service, then paste an API
+key created at [opencsg.com](https://opencsg.com/) under **账号设置 → API
+Keys**. The key is normally shown only once.
+
+Or sign in through the browser:
+
+```sh
+opencode auth login opencsg --method oauth
+```
+
+Leave **Gateway URL** empty for the public service. OpenCode opens the OpenCSG
+sign-in page, receives the callback on localhost, exchanges the login for an AI
+Gateway key and saves that key. The browser must be able to reach the machine
+running OpenCode; use API-key login on a headless host or a private gateway
+that cannot complete this callback flow.
+
+You can also run `/connect` in the OpenCode TUI, choose **OpenCSG**, and select
+either **OpenCSG API key** or **Sign in with OpenCSG**.
+
+### 3. Verify the connection
+
+```sh
+opencode models --standalone | grep '^opencsg/'
+```
+
+The public catalog is visible before login. After login, the account's own
+catalog is used, including models available through its organization.
+
+### 4. Run a prompt
+
+Choose one of the model IDs printed by the previous command:
+
+```sh
+opencode run --standalone -m opencsg/<model> "用一句话介绍 OpenCSG"
+```
+
+In the TUI, open `/models` and select an `OpenCSG` model instead. After the
+plugin has loaded, you can normally omit `--standalone`; it is useful for
+testing a newly installed plugin against a fresh local server.
+
+### Custom gateway
+
+For a private CSGHub / OpenCSG deployment, enter its gateway URL during login.
+These forms are accepted and normalized to the `/v1` base:
+
+```text
+https://ai-gateway.example.com
+https://ai-gateway.example.com/aigateway
+https://ai-gateway.example.com/aigateway/v1
+```
+
+The deployment must expose OpenAI-compatible `/models` and
+`/chat/completions` endpoints, including streaming.
+
+## Use in magpie
+
+```sh
+magpie plugin add github:CheinTian/magpie-opencsg-auth
 magpie plugin login opencsg oauth
+magpie plugin
 magpie provider test opencsg
 ```
 
-The public model catalog can be read before signing in. After sign-in the
-account's own catalog is used, including models available through its
-organization.
+To use the local checkout instead:
 
-The plugin uses magpie's OpenCode-compatible provider interface, but its
-sign-in and model hooks are designed and tested for magpie.
-
-## Sign-in
-
-There are two methods:
-
-- **Sign in with OpenCSG** opens the OpenCSG IAM page, waits for a local
-  callback, then creates or reads the account's built-in AI Gateway key
-  automatically. This is the default for `magpie plugin login opencsg oauth`.
-- **OpenCSG API key** accepts an existing `gw-sk-…` key. Sign in at
-  [opencsg.com](https://opencsg.com/), open **账号设置 → API Keys** (or an
-  organization's **API Keys** page), create a key and paste the full value.
-  It is shown only once.
-
-An API key entered this way is saved by magpie as-is. Its first live model
-refresh or request is what tells whether OpenCSG accepts it.
-
-For OAuth with a public OpenCSG deployment, the plugin follows the authorize
-URL from `/login` and uses the public IAM app as a fallback. A private CSGHub
-deployment must expose its own `/login` redirect with a callback URI that
-accepts external `state` URLs. The gateway URL prompt accepts either the host
-root, `/aigateway`, or `/aigateway/v1`.
-
-On a headless or Docker host, magpie may ask you to paste the final callback
-URL. This is normal: the local callback listener runs inside the machine that
-runs magpie.
-
-The API key method asks for the optional gateway URL first, then magpie asks
-for the key itself. The OAuth method asks only for the optional gateway URL and
-opens the browser.
-
-The gateway URL prompt is optional. Leave it empty for the public
-OpenCSG gateway, or enter a private deployment's base URL. Both forms are
-accepted:
-
-```text
-https://opencsg.com/aigateway
-https://opencsg.com/aigateway/v1
+```sh
+magpie plugin add ./magpie-opencsg-auth
 ```
 
-The resulting AI Gateway key is stored as an API key in magpie's
-`plugin-auth.json` (or OpenCode's own auth store), not in this repository.
-The short-lived CSGHub JWT used during sign-in is not saved.
+For API-key login, choose the API-key method instead of `oauth`. The optional
+gateway prompt accepts the same URL forms described above.
 
-OAuth-fetched keys are checked against `GET /v1/models` before they are saved.
+## Model discovery
 
-## Models
+The plugin reads the live OpenCSG model catalog. It exposes text-generation and
+image-text-to-text chat models; embedding, rerank, speech and image-generation
+tasks are skipped.
 
-The plugin reads the live OpenCSG model catalog. Text-generation and
-image-text-to-text models are exposed; speech, embedding, rerank and image
-generation tasks are skipped because this is a chat provider.
+If OpenCSG does not publish context or output limits, the plugin leaves them at
+`0` instead of inventing values. Prices are converted from CNY per million
+tokens to USD for OpenCode/magpie cost estimates; those estimates do not
+replace the OpenCSG invoice.
 
-Before sign-in, the catalog is fetched from the public OpenCSG gateway. The
-gateway currently reports 23 models, of which the plugin exposes the 18 chat
-models. Model availability can differ by account or organization.
+A failed catalog refresh keeps the provider and the last complete model list
+visible instead of turning a temporary gateway outage into an empty provider.
 
-OpenCSG's list does not always publish context or output limits. In that case
-the plugin leaves the limits at `0`, which lets magpie fall back to its own
-catalog and user settings rather than inventing a window.
+## Security
 
-Prices in the OpenCSG response are in CNY per million tokens. The plugin
-converts them to USD for OpenCode/magpie cost estimates. Those estimates do
-not replace the OpenCSG invoice.
+The AI Gateway key is stored in OpenCode's or magpie's own credential store,
+not in this repository. The short-lived CSGHub JWT used during browser login is
+not saved.
 
-## Custom deployments
-
-For a private CSGHub deployment, enter its gateway URL during sign-in, for
-example:
-
-```text
-https://ai-gateway.example.com/v1
-```
-
-The deployment must expose the OpenAI-compatible `/chat/completions`,
-`/models` and streaming endpoints. The URL may point at the host root,
-`/aigateway`, or `/aigateway/v1`; the plugin normalizes it to the gateway's
-`/v1` base.
-
-For example, a gateway mounted at `https://opencsg.example.com/aigateway`
-accepts requests at
-`https://opencsg.example.com/aigateway/v1/chat/completions`.
-
-## Develop
+## Development
 
 ```sh
 bun test
 bun run check
 ```
 
-There are no runtime dependencies.
+The package has no runtime dependencies. OAuth callback, JWT parsing and key
+exchange are covered by unit tests; the complete OpenCode request path has
+been tested against a local mock gateway. A real public OpenCSG OAuth login
+still needs verification with a live account.
 
 ## License
 

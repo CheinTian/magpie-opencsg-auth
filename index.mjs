@@ -15,6 +15,9 @@ const DEFAULT_IAM_AUTHORIZE = "https://iam.opencsg.com/login/oauth/authorize"
 const DEFAULT_IAM_CLIENT_ID = "d623c957e69976c8a7a8"
 const DEFAULT_IAM_CALLBACK = "https://opencsg.com/api/v1/callback/casdoor"
 const NPM = "@ai-sdk/openai-compatible"
+const OPENCODE_NPM = "@opencode/ai/providers/openai-compatible"
+const PLUGIN_ID = "magpie-opencsg-auth"
+const CLIENT_HEADER = "opencsg-magpie/0.1.1"
 const TIMEOUT_MS = 20_000
 const OAUTH_TIMEOUT_MS = 10 * 60_000
 const MAX_PAGES = 20
@@ -445,6 +448,272 @@ function markSignIn(res) {
   })
 }
 
+function openCodeGatewayField() {
+  return {
+    type: "string",
+    // OpenCode overlays a key credential's form answers onto the provider
+    // settings. Avoid the reserved `baseURL` key so the user's unnormalized
+    // input cannot override the `/v1` endpoint selected below.
+    key: "gateway",
+    title: "Gateway URL",
+    description: "Leave empty for the public OpenCSG AI Gateway.",
+    placeholder: DEFAULT_BASE,
+    format: "uri",
+  }
+}
+
+function credentialAuth(credential) {
+  if (credential?.type === "oauth") {
+    return {
+      key: text(credential.access),
+      baseURL: normalizeBase(credential.metadata?.baseURL),
+    }
+  }
+  if (credential?.type === "key") {
+    return {
+      key: text(credential.key),
+      // `gateway` is the current OpenCode field. `baseURL` keeps credentials
+      // created by earlier versions working.
+      baseURL: normalizeBase(
+        credential.configuration?.gateway ?? credential.configuration?.baseURL,
+      ),
+    }
+  }
+  return undefined
+}
+
+function openCodeModel(item, previous) {
+  const model = modelOf(item, { models: previous ?? {} })
+  if (!model.id) return undefined
+  return {
+    id: model.id,
+    modelID: model.id,
+    providerID: PROVIDER,
+    name: model.name,
+    package: OPENCODE_NPM,
+    capabilities: {
+      tools: model.tool_call,
+      input: model.attachment ? ["text", "image"] : ["text"],
+      output: ["text"],
+    },
+    variants: [],
+    time: { released: 0 },
+    cost: model.cost ? [model.cost] : [],
+    status: model.status ?? "active",
+    enabled: true,
+    limit: {
+      context: model.limit?.context ?? 0,
+      output: model.limit?.output ?? 0,
+    },
+  }
+}
+
+function openCodeProvider(baseURL) {
+  return {
+    id: PROVIDER,
+    integrationID: PROVIDER,
+    name: "OpenCSG",
+    activation: "enabled",
+    package: OPENCODE_NPM,
+    settings: { baseURL },
+    headers: { "X-OpenCSG-Client": CLIENT_HEADER },
+  }
+}
+
+function openCodeModels(items, previous, baseURL) {
+  const models = new Map()
+  for (const item of items) {
+    if (!supportsChat(item)) continue
+    const model = openCodeModel(item, previous?.get?.(item.id) ?? previous?.[item.id])
+    if (!model) continue
+    model.settings = { baseURL }
+    models.set(model.id, model)
+  }
+  return models
+}
+
+function fallbackOpenCodeModels(baseURL = DEFAULT_BASE) {
+  return openCodeModels(
+    Object.entries(FALLBACK_MODELS).map(([id, model]) => ({ ...model, id })),
+    undefined,
+    baseURL,
+  )
+}
+
+function withOpenCodeBaseURL(models, baseURL) {
+  const result = new Map()
+  for (const [id, model] of models) {
+    result.set(id, {
+      ...model,
+      settings: {
+        ...(isObject(model.settings) ? model.settings : {}),
+        baseURL,
+      },
+    })
+  }
+  return result
+}
+
+function openCodeOAuth() {
+  return {
+    integrationID: PROVIDER,
+    method: {
+      id: "oauth",
+      type: "oauth",
+      label: "Sign in with OpenCSG",
+      form: [openCodeGatewayField()],
+    },
+    async authorize(inputs) {
+      let gateway
+      try {
+        gateway = normalizeBase(inputs?.gateway ?? inputs?.baseURL)
+      } catch (e) {
+        throw new Error(e.message)
+      }
+
+      let session
+      try {
+        session = await callbackServer()
+      } catch (e) {
+        throw new Error(e.message)
+      }
+
+      let url
+      try {
+        url = await authorizeURL(portalOf(gateway), session.callbackURL)
+      } catch (e) {
+        session.close()
+        throw new Error(e.message)
+      }
+
+      const callback = (async () => {
+        try {
+          const result = await session.completion
+          if (result.error) throw result.error
+          const { key, claims } = await keyForJWT(result.jwt, gateway)
+          await validateKey(gateway, key)
+          return {
+            type: "oauth",
+            methodID: "oauth",
+            access: key,
+            refresh: "",
+            expires: 0,
+            metadata: {
+              baseURL: gateway,
+              username: claims.username,
+              uuid: claims.uuid,
+            },
+          }
+        } finally {
+          session.close()
+        }
+      })()
+
+      return {
+        mode: "auto",
+        url,
+        instructions:
+          "Finish signing in to OpenCSG in your browser. OpenCode will fetch an AI Gateway key automatically.",
+        callback,
+      }
+    },
+    label: (credential) => text(credential.metadata?.username) || undefined,
+  }
+}
+
+async function readOpenCodeCatalog(ctx, models) {
+  const connection = await ctx.integration.connection.active(PROVIDER)
+  const auth = connection
+    ? credentialAuth(
+        await ctx.integration.connection.resolve(connection).catch(() => undefined),
+      )
+    : undefined
+  const baseURL = auth?.baseURL ?? DEFAULT_BASE
+  const retained =
+    models instanceof Map && models.size
+      ? withOpenCodeBaseURL(models, baseURL)
+      : fallbackOpenCodeModels(baseURL)
+  try {
+    const items = await readModels(baseURL, auth?.key ?? "")
+    const live = openCodeModels(items, models, baseURL)
+    return {
+      baseURL,
+      models: live.size ? live : retained,
+      sourceConnection: connection,
+    }
+  } catch {
+    // A failed refresh cannot prove that the retained catalog belongs to the
+    // active connection. Keep the provider visible, but do not bind stale
+    // models to a new credential.
+    return { baseURL, models: retained }
+  }
+}
+
+async function openCodeSetup(ctx) {
+  let models = fallbackOpenCodeModels()
+  let loaded = await readOpenCodeCatalog(ctx, models)
+  models = loaded.models
+
+  await ctx.integration.transform((editor) => {
+    editor.update(PROVIDER, (integration) => {
+      integration.name = "OpenCSG"
+    })
+    editor.method.update({
+      integrationID: PROVIDER,
+      method: {
+        type: "key",
+        label: "OpenCSG API key",
+        form: [openCodeGatewayField()],
+      },
+    })
+    editor.method.update(openCodeOAuth())
+  })
+
+  // Register the transform once. Credential events update the captured snapshot
+  // and reload the provider registry instead of stacking duplicate transforms.
+  await ctx.provider.transform((editor) => {
+    editor.add({
+      info: openCodeProvider(loaded.baseURL),
+      models: Array.from(loaded.models.values()),
+      ...(loaded.sourceConnection ? { sourceConnection: loaded.sourceConnection } : {}),
+    })
+  })
+
+  const controller = new AbortController()
+  void (async () => {
+    try {
+      for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
+        if (event.type === "credential.switched") {
+          if (event.data.integrationID !== PROVIDER) continue
+        } else if (event.type !== "credential.updated") {
+          continue
+        }
+        // A key login emits the event before its batched transform has
+        // necessarily become visible. Reload first so the catalog is read with
+        // the new credential.
+        await ctx.provider.reload()
+        const next = await readOpenCodeCatalog(ctx, models)
+        models = next.models
+        loaded = next
+        await ctx.provider.reload()
+      }
+    } catch (e) {
+      if (!controller.signal.aborted) {
+        console.error("[opencsg] event stream failed:", e)
+      }
+    }
+  })()
+
+  return () => controller.abort()
+}
+
+const OpenCodePlugin = {
+  id: PLUGIN_ID,
+  setup: openCodeSetup,
+}
+
+export default OpenCodePlugin
+
 export const OpenCSGAuthPlugin = async ({ client } = {}) => {
   return {
     config: async (cfg) => {
@@ -529,7 +798,7 @@ export const OpenCSGAuthPlugin = async ({ client } = {}) => {
         return {
           baseURL: base,
           apiKey: auth.key,
-          headers: { "X-OpenCSG-Client": "opencsg-magpie/0.1.0" },
+          headers: { "X-OpenCSG-Client": CLIENT_HEADER },
           async fetch(input, init) {
             const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined))
             headers.set("Authorization", `Bearer ${auth.key}`)
@@ -574,6 +843,13 @@ export const _internal = {
   PROVIDER,
   DEFAULT_BASE,
   FALLBACK_MODELS,
+  OpenCodePlugin,
+  credentialAuth,
+  openCodeModel,
+  openCodeModels,
+  openCodeProvider,
+  openCodeOAuth,
+  openCodeSetup,
   plugin: OpenCSGAuthPlugin,
   normalizeBase,
   portalOf,

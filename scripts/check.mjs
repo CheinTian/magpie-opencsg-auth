@@ -2,7 +2,17 @@
 // making a network request.
 const mod = await import(new URL("../index.mjs", import.meta.url).href)
 const problems = []
-const fns = Object.entries(mod).filter(([name, value]) => name !== "_internal" && typeof value === "function")
+const fns = Object.entries(mod).filter(
+  ([name, value]) => name !== "_internal" && name !== "default" && typeof value === "function",
+)
+
+const openCodePlugin = mod.default
+if (!openCodePlugin || typeof openCodePlugin !== "object") {
+  problems.push("default: no OpenCode v2 plugin definition")
+} else {
+  if (typeof openCodePlugin.id !== "string" || !openCodePlugin.id) problems.push("default: id")
+  if (typeof openCodePlugin.setup !== "function") problems.push("default: setup")
+}
 
 if (!fns.length) problems.push("exports no plugin function")
 
