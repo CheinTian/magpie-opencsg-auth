@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test"
 
 import OpenCodePlugin, { _internal } from "./index.mjs"
+import * as MagpieModule from "./magpie.mjs"
 
 const realFetch = globalThis.fetch
 
@@ -450,7 +451,7 @@ describe("plugin hooks", () => {
 
     expect(request.input).toBe("https://private.example/v1/chat/completions")
     expect(request.init.headers.get("authorization")).toBe("Bearer gw-sk-test")
-    expect(request.init.headers.get("x-opencsg-client")).toBe("opencsg-magpie/0.1.1")
+    expect(request.init.headers.get("x-opencsg-client")).toBe("opencsg-magpie/0.1.2")
     expect(request.init.headers.get("content-length")).toBeNull()
     expect(request.init.signal).toBe(signal)
     expect(res.headers.get("x-magpie-sign-in")).toBe("expired")
@@ -521,6 +522,11 @@ describe("OpenCode v2 plugin", () => {
   test("exports the OpenCode v2 definition", () => {
     expect(OpenCodePlugin.id).toBe("magpie-opencsg-auth")
     expect(typeof OpenCodePlugin.setup).toBe("function")
+  })
+
+  test("separate magpie entry exports an OpenCode v1 plugin function", () => {
+    expect(Object.keys(MagpieModule)).toEqual(["OpenCSGAuthPlugin"])
+    expect(typeof MagpieModule.OpenCSGAuthPlugin).toBe("function")
   })
 
   test("registers OpenCSG, key auth, OAuth, and a public model catalog", async () => {

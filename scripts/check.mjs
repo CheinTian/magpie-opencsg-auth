@@ -1,6 +1,7 @@
 // Loads the plugin the way magpie does and validates its hook shape without
 // making a network request.
 const mod = await import(new URL("../index.mjs", import.meta.url).href)
+const magpie = await import(new URL("../magpie.mjs", import.meta.url).href)
 const problems = []
 const fns = Object.entries(mod).filter(
   ([name, value]) => name !== "_internal" && name !== "default" && typeof value === "function",
@@ -12,6 +13,10 @@ if (!openCodePlugin || typeof openCodePlugin !== "object") {
 } else {
   if (typeof openCodePlugin.id !== "string" || !openCodePlugin.id) problems.push("default: id")
   if (typeof openCodePlugin.setup !== "function") problems.push("default: setup")
+}
+
+if (typeof magpie.OpenCSGAuthPlugin !== "function") {
+  problems.push("magpie: no OpenCSGAuthPlugin function")
 }
 
 if (!fns.length) problems.push("exports no plugin function")
