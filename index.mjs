@@ -21,12 +21,19 @@ const NPM = "@ai-sdk/openai-compatible"
 const ALTERNATE_PROTOCOLS = ["@ai-sdk/anthropic", "@ai-sdk/openai"]
 const OPENCODE_NPM = "@opencode/ai/providers/openai-compatible"
 const PLUGIN_ID = "magpie-opencsg-auth"
-const CLIENT_HEADER = "opencsg-magpie/0.1.5"
+const CLIENT_HEADER = "opencsg-magpie/0.1.6"
 const TIMEOUT_MS = 20_000
 const TOOL_TIMEOUT_MS = 45_000
 const OAUTH_TIMEOUT_MS = 10 * 60_000
 const MAX_PAGES = 20
 const DEFAULT_MAGPIE_GATEWAY = "http://127.0.0.1:3425/v1"
+
+const ACCOUNT_PROTOCOLS = new Set(["anthropic", "chat", "responses"])
+const PROTOCOL_LABELS = {
+  anthropic: "Anthropic Messages",
+  chat: "Chat Completions",
+  responses: "OpenAI Responses",
+}
 
 const IMAGE_TASKS = new Set(["text-to-image", "image-to-image"])
 const VIDEO_TASKS = new Set([
@@ -105,6 +112,27 @@ function protocolEndpoints(gateway = DEFAULT_BASE) {
     responses: chat,
     decide: chat,
   }
+}
+
+function normalizeAccountProtocol(value) {
+  const protocol = text(value).toLowerCase()
+  return ACCOUNT_PROTOCOLS.has(protocol) ? protocol : ""
+}
+
+// requestProtocol reads the native API a request is written for. System One
+// and other gateway extensions deliberately return "".
+function requestProtocol(input) {
+  let pathname
+  try {
+    pathname = new URL(input instanceof Request ? input.url : String(input)).pathname
+  } catch {
+    return ""
+  }
+  const path = pathname.toLowerCase().replace(/\/+$/, "")
+  if (/(^|\/)chat\/completions$/.test(path) || /(^|\/)completions$/.test(path)) return "chat"
+  if (/(^|\/)messages(?:\/count_tokens)?$/.test(path)) return "anthropic"
+  if (/(^|\/)responses$/.test(path)) return "responses"
+  return ""
 }
 
 function normalizeSystemOne(value, gateway = DEFAULT_BASE) {
@@ -330,7 +358,19 @@ const SYSTEM_ONE_PROMPT = {
   },
 }
 
-const AUTH_PROMPTS = [BASE_URL_PROMPT, SYSTEM_ONE_PROMPT]
+const ACCOUNT_PROTOCOL_PROMPT = {
+  type: "select",
+  key: "protocol",
+  message: "Protocol this account uses",
+  options: [
+    { label: "Any protocol", value: "", hint: "Use this account on every OpenCSG endpoint" },
+    { label: "Anthropic Messages", value: "anthropic", hint: "Claude Code and Anthropic SDK clients" },
+    { label: "Chat Completions", value: "chat", hint: "Most OpenAI-compatible clients" },
+    { label: "OpenAI Responses", value: "responses", hint: "Codex and OpenAI Responses clients" },
+  ],
+}
+
+const AUTH_PROMPTS = [BASE_URL_PROMPT, SYSTEM_ONE_PROMPT, ACCOUNT_PROTOCOL_PROMPT]
 
 function authMethod(type, label) {
   return {
@@ -1458,6 +1498,7 @@ export const OpenCSGAuthPlugin = async ({ client } = {}) => {
           async authorize(inputs) {
             let gateway
             let systemOne
+            const protocol = normalizeAccountProtocol(inputs?.protocol)
             try {
               gateway = normalizeBase(inputs?.baseURL)
               systemOne = normalizeSystemOne(inputs?.systemOneURL, gateway)
@@ -1498,6 +1539,7 @@ export const OpenCSGAuthPlugin = async ({ client } = {}) => {
                       baseURL: gateway === DEFAULT_BASE ? "" : gateway,
                       systemOneURL:
                         systemOne === protocolEndpoints(gateway).decide ? "" : systemOne,
+                      ...(protocol ? { protocol } : {}),
                       username: claims.username,
                       uuid: claims.uuid,
                     },
@@ -1524,11 +1566,31 @@ export const OpenCSGAuthPlugin = async ({ client } = {}) => {
           auth.metadata?.systemOneURL || endpointSettings.systemOneURL,
           base,
         )
+        const accountProtocol = normalizeAccountProtocol(auth.metadata?.protocol)
         return {
           baseURL: base,
           apiKey: auth.key,
           headers: { "X-OpenCSG-Client": CLIENT_HEADER },
           async fetch(input, init) {
+            const wanted = requestProtocol(input)
+            if (accountProtocol && wanted && accountProtocol !== wanted) {
+              const account = text(auth.metadata?.username) || "this OpenCSG account"
+              return Response.json(
+                {
+                  error: {
+                    type: "account_protocol_mismatch",
+                    message:
+                      `${account} is restricted to ${PROTOCOL_LABELS[accountProtocol]}; ` +
+                      `this request is for ${PROTOCOL_LABELS[wanted]}.`,
+                  },
+                },
+                {
+                  status: 503,
+                  statusText: "OpenCSG account protocol mismatch",
+                  headers: { "X-OpenCSG-Account-Protocol": accountProtocol },
+                },
+              )
+            }
             const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined))
             headers.set("Authorization", `Bearer ${auth.key}`)
             headers.set("Accept", headers.get("Accept") ?? "application/json")
@@ -1586,6 +1648,7 @@ export const OpenCSGAuthPlugin = async ({ client } = {}) => {
 export const _internal = {
   PROVIDER,
   DEFAULT_BASE,
+  ACCOUNT_PROTOCOLS,
   ALTERNATE_PROTOCOLS,
   FALLBACK_MODELS,
   DEFAULT_MAGPIE_GATEWAY,
@@ -1607,7 +1670,9 @@ export const _internal = {
   magpieGatewayBase,
   magpieToolRuntime,
   plugin: OpenCSGAuthPlugin,
+  normalizeAccountProtocol,
   normalizeBase,
+  requestProtocol,
   portalOf,
   parseJWTPayload,
   keyFromPayload,

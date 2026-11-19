@@ -45,6 +45,17 @@ for (const [name, fn] of fns) {
     if (method.type === "oauth" && typeof method.authorize !== "function") {
       problems.push(`${name}: oauth method has no authorize`)
     }
+    const protocol = method.prompts?.find((prompt) => prompt.key === "protocol")
+    if (!protocol) {
+      problems.push(`${name}: login has no account protocol prompt`)
+    } else if (
+      protocol.type !== "select" ||
+      !["", "anthropic", "chat", "responses"].every((value) =>
+        protocol.options?.some((option) => option.value === value),
+      )
+    ) {
+      problems.push(`${name}: account protocol prompt is incomplete`)
+    }
   }
   if (hooks.config) {
     const cfg = { provider: {} }

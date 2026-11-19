@@ -48,6 +48,24 @@ describe("normalizeBase", () => {
   })
 })
 
+describe("account protocol", () => {
+  test("normalizes only the protocols OpenCSG exposes", () => {
+    expect(_internal.normalizeAccountProtocol(" Anthropic ")).toBe("anthropic")
+    expect(_internal.normalizeAccountProtocol("chat")).toBe("chat")
+    expect(_internal.normalizeAccountProtocol("responses")).toBe("responses")
+    expect(_internal.normalizeAccountProtocol("")).toBe("")
+    expect(_internal.normalizeAccountProtocol("gemini")).toBe("")
+  })
+
+  test("reads the protocol from native request paths", () => {
+    expect(_internal.requestProtocol("https://example.com/v1/chat/completions")).toBe("chat")
+    expect(_internal.requestProtocol("https://example.com/v1/messages")).toBe("anthropic")
+    expect(_internal.requestProtocol("https://example.com/v1/messages/count_tokens")).toBe("anthropic")
+    expect(_internal.requestProtocol("https://example.com/v1/responses")).toBe("responses")
+    expect(_internal.requestProtocol("https://example.com/v1/systemone")).toBe("")
+  })
+})
+
 describe("OAuth", () => {
   test("normalizes the portal from gateway URLs", () => {
     expect(_internal.portalOf("https://opencsg.com/aigateway/v1")).toBe("https://opencsg.com")
@@ -696,8 +714,19 @@ describe("plugin hooks", () => {
     expect(methods[0].prompts.map((prompt) => prompt.key)).toEqual([
       "baseURL",
       "systemOneURL",
+      "protocol",
     ])
+    expect(methods[0].prompts[2]).toMatchObject({
+      type: "select",
+      options: [
+        { label: "Any protocol", value: "" },
+        { label: "Anthropic Messages", value: "anthropic" },
+        { label: "Chat Completions", value: "chat" },
+        { label: "OpenAI Responses", value: "responses" },
+      ],
+    })
     expect(methods[1].prompts[0].key).toBe("baseURL")
+    expect(methods[1].prompts[2].key).toBe("protocol")
 
     const localFetch = globalThis.fetch
     globalThis.fetch = async (input) => {
@@ -781,7 +810,7 @@ describe("plugin hooks", () => {
 
     expect(requests[0].input).toBe("https://private.example/v1/chat/completions")
     expect(requests[0].init.headers.get("authorization")).toBe("Bearer gw-sk-test")
-    expect(requests[0].init.headers.get("x-opencsg-client")).toBe("opencsg-magpie/0.1.5")
+    expect(requests[0].init.headers.get("x-opencsg-client")).toBe("opencsg-magpie/0.1.6")
     expect(requests[0].init.headers.get("content-length")).toBeNull()
     expect(requests[0].init.signal).toBe(signal)
     expect(res.headers.get("x-magpie-sign-in")).toBe("expired")
@@ -793,6 +822,47 @@ describe("plugin hooks", () => {
       body: "{}",
     })
     expect(requests[1].input).toBe("https://system.example/v1/systemone")
+  })
+
+  test("loader enforces the protocol selected for an account", async () => {
+    const auth = {
+      type: "api",
+      key: "gw-sk-test",
+      metadata: {
+        baseURL: "https://private.example/v1",
+        protocol: "anthropic",
+        username: "alice",
+      },
+    }
+    const hooks = await load(auth)
+    const loader = await hooks.auth.loader(async () => auth)
+    const requests = []
+    globalThis.fetch = async (input, init) => {
+      requests.push({ input, init })
+      return new Response("ok")
+    }
+
+    const blocked = await loader.fetch("https://private.example/v1/chat/completions", {
+      method: "POST",
+      body: "{}",
+    })
+    expect(blocked.status).toBe(503)
+    expect(blocked.headers.get("x-opencsg-account-protocol")).toBe("anthropic")
+    expect(await blocked.json()).toEqual({
+      error: {
+        type: "account_protocol_mismatch",
+        message:
+          "alice is restricted to Anthropic Messages; this request is for Chat Completions.",
+      },
+    })
+    expect(requests).toHaveLength(0)
+
+    const allowed = await loader.fetch("https://private.example/v1/messages", {
+      method: "POST",
+      body: "{}",
+    })
+    expect(allowed.status).toBe(200)
+    expect(requests).toHaveLength(1)
   })
 
   test("derives System One from a custom account gateway when it is not configured", async () => {

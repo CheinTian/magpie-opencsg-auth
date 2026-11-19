@@ -10,8 +10,8 @@ OpenCSG AI Gateway provider for **OpenCode v2** and **magpie**.
 ## Features
 
 - Advertises effective models on Chat Completions, Anthropic Messages and
-  OpenAI Responses, so magpie shows a per-key protocol selector and can route
-  each agent's native request format.
+  OpenAI Responses, and lets API-key or OAuth login bind each OpenCSG account
+  to any one of those protocols (the loader refuses requests for the others).
 - Supports a configurable System One URL, defaulting to the gateway's `/v1`
   base, and reports the active endpoints from `opencsg_models`.
 - Discovers the signed-in account's chat, image, video and System One decision
@@ -184,7 +184,19 @@ magpie plugin add ./magpie-opencsg-auth
 For API-key login, choose the API-key method instead of `oauth`. The optional
 gateway prompt accepts the same URL forms described above. The optional
 **System One URL** prompt accepts either its `/v1` base or the full
-`/systemone` URL; leave it empty to use the gateway base.
+`/systemone` URL; leave it empty to use the gateway base. The **Protocol this
+account uses** prompt offers:
+
+- **Any protocol** - the account may serve every advertised endpoint.
+- **Anthropic Messages** - only `/v1/messages` and Anthropic token-counting
+  requests use the account.
+- **Chat Completions** - only `/v1/chat/completions` uses the account.
+- **OpenAI Responses** - only `/v1/responses` uses the account.
+
+The choice is stored with that account's credential metadata. Re-run
+`magpie plugin login opencsg` to change it. A request for another protocol gets
+a retryable `503` from the plugin loader, so magpie can move to an account that
+supports it.
 
 ### Endpoints and protocol switching
 
@@ -202,11 +214,10 @@ URLs are normalized and the same endpoints are derived automatically. Existing
 config values are preserved.
 
 Every chat model is advertised to magpie on all three conversation protocols.
-That makes magpie's protocol selector appear beside each key and lets requests
-arrive as Chat Completions, Anthropic Messages or OpenAI Responses. The plugin
-forwards them to the same normalized gateway base. The `opencsg_models` tool
-includes an `endpoints` object with the actual Chat, Anthropic, Responses and
-System One URLs in use.
+Requests can therefore arrive as Chat Completions, Anthropic Messages or OpenAI
+Responses, and the plugin forwards them to the same normalized gateway base.
+The `opencsg_models` tool includes an `endpoints` object with the actual Chat,
+Anthropic, Responses and System One URLs in use.
 
 System One is enabled with the boolean `decide: true` that magpie's plugin host
 expects; `decideURL` keeps the chosen endpoint. At sign-in, the **System One
@@ -214,11 +225,19 @@ URL** prompt can point System One at another gateway host. Existing sign-ins
 derive it from their gateway automatically, and older `decide: true` values
 continue to work.
 
-> magpie's plugin-provider editor currently exposes the protocol selector but
-> does not provide free-form endpoint fields for plugin-backed providers. Use
-> the sign-in prompts, or edit the provider configuration below, to change a
-> URL. Custom providers created directly in magpie retain magpie's native
-> endpoint editor.
+> DeepSeek, oMLX and similar built-in providers use magpie's standard provider
+> **key** rows, where the host draws its native "Any protocol / Anthropic /
+> Chat Completions" pill. OpenCSG is a plugin-backed provider whose sign-ins are
+> plugin **accounts**, and the current magpie host does not expose that native
+> pill on plugin account rows. This plugin therefore offers the equivalent
+> per-account choice in the login form and enforces it in the loader. Rendering
+> the pill inline on plugin account rows requires a magpie host hook; it cannot
+> be injected by a provider plugin alone.
+
+> magpie's plugin-provider editor does not provide free-form endpoint fields
+> for plugin-backed providers. Use the sign-in prompts, or edit the provider
+> configuration below, to change a URL. Custom providers created directly in
+> magpie retain magpie's native endpoint editor.
 
 The equivalent provider configuration is:
 
