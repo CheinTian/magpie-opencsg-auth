@@ -3,6 +3,13 @@
 const mod = await import(new URL("../index.mjs", import.meta.url).href)
 const magpie = await import(new URL("../magpie.mjs", import.meta.url).href)
 const problems = []
+const expectedTools = [
+  "opencsg_models",
+  "opencsg_generate_image",
+  "opencsg_generate_video",
+  "opencsg_video_status",
+  "opencsg_system_one",
+]
 const fns = Object.entries(mod).filter(
   ([name, value]) => name !== "_internal" && name !== "default" && typeof value === "function",
 )
@@ -46,6 +53,16 @@ for (const [name, fn] of fns) {
     if (!p?.npm || !p?.models || !Object.keys(p.models).length) {
       problems.push(`${name}: config gives ${auth.provider} no npm or models`)
     }
+    if (p?.decide !== true) problems.push(`${name}: provider does not enable System One`)
+  }
+  for (const tool of expectedTools) {
+    const def = hooks.tool?.[tool]
+    if (!def) {
+      problems.push(`${name}: missing tool ${tool}`)
+      continue
+    }
+    if (!def.args || def.args.type !== "object") problems.push(`${name}: ${tool} args`)
+    if (typeof def.execute !== "function") problems.push(`${name}: ${tool} execute`)
   }
 }
 

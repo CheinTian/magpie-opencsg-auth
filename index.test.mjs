@@ -7,6 +7,9 @@ const realFetch = globalThis.fetch
 
 afterEach(() => {
   globalThis.fetch = realFetch
+  _internal.catalogCache.items = []
+  _internal.catalogCache.base = ""
+  _internal.catalogCache.at = 0
 })
 
 const modelPage = (data, extra = {}) => ({
@@ -219,19 +222,22 @@ describe("model metadata", () => {
     expect([...tasks]).toEqual(["text-generation", "image-text-to-text"])
   })
 
-  test("skips non-chat tasks and maps chat capabilities", () => {
+  test("maps chat, image, video and decision models without mixing chat capabilities", () => {
     const provider = { models: {} }
     const models = _internal.liveModels(
       [
         { id: "chat", task: "text-generation", support_function_call: true },
         { id: "vision", task: "image-text-to-text" },
+        { id: "image", task: "text-to-image" },
+        { id: "video", task: "text-to-video" },
+        { id: "decision", task: "typed-decisions" },
         { id: "embed", task: "text-embedding" },
         { id: "rerank", metadata: { tasks: ["rerank"] } },
       ],
       provider,
     )
 
-    expect(Object.keys(models)).toEqual(["chat", "vision"])
+    expect(Object.keys(models)).toEqual(["chat", "vision", "image", "video", "decision"])
     expect(models.chat.tool_call).toBe(true)
     expect(models.chat.capabilities.toolcall).toBe(true)
     expect(models.chat.attachment).toBe(false)
@@ -241,6 +247,39 @@ describe("model metadata", () => {
       id: "chat",
       npm: "@ai-sdk/openai-compatible",
     })
+    expect(models.image).toMatchObject({
+      kind: "image",
+      tool_call: false,
+      modalities: { input: ["text"], output: ["image"] },
+      capabilities: { output: { text: false, image: true, video: false } },
+    })
+    expect(models.video).toMatchObject({
+      kind: "video",
+      modalities: { input: ["text"], output: ["video"] },
+      capabilities: { output: { text: false, image: false, video: true } },
+    })
+    expect(models.decision).toMatchObject({
+      kind: "decision",
+      decides: true,
+      tool_call: false,
+    })
+  })
+
+  test("chooseModel discovers media and decision models dynamically", () => {
+    const items = [
+      { id: "chat", task: "text-generation" },
+      { id: "image-a", task: "text-to-image" },
+      { id: "video-a", task: "image-to-video", availability: { is_available: false } },
+      { id: "video-b", task: "text-to-video" },
+      { id: "decision-a", task: "typed-decisions" },
+    ]
+
+    expect(_internal.chooseModel(items, "image").id).toBe("image-a")
+    expect(_internal.chooseModel(items, "video").id).toBe("video-b")
+    expect(_internal.chooseModel(items, "decision").id).toBe("decision-a")
+    expect(_internal.chooseModel(items, "image", "opencsg/image-a").id).toBe("image-a")
+    expect(() => _internal.chooseModel(items, "video", "image-a")).toThrow("not a video model")
+    expect(() => _internal.chooseModel(items, "video", "video-a")).toThrow("currently unavailable")
   })
 
   test("uses an explicit vision flag and preserves context limits", () => {
@@ -298,6 +337,198 @@ describe("model metadata", () => {
   })
 })
 
+describe("media and System One tools", () => {
+  const catalog = [
+    { id: "chat", task: "text-generation" },
+    { id: "image-a", task: "text-to-image" },
+    { id: "video-a", task: "image-to-video" },
+    { id: "decision-a", task: "typed-decisions" },
+  ]
+
+  const runtime = (responses) => {
+    const calls = []
+    return {
+      calls,
+      connection: async () => ({ baseURL: "https://gateway.example/v1", key: "gw-sk-test" }),
+      catalog: async () => catalog,
+      modelName: (_connection, id) => `opencsg/${_internal.withoutProvider(id)}`,
+      async request(_connection, path, options) {
+        calls.push({ path, options })
+        const response = responses[path]
+        if (response instanceof Error) throw response
+        return response
+      },
+    }
+  }
+
+  test("lists models by capability with SDK-facing model IDs", async () => {
+    const tools = _internal.createToolDefinitions(runtime({}))
+    const result = await tools.opencsg_models.execute({ kind: "video" }, {})
+
+    expect(result.models).toEqual([
+      {
+        id: "video-a",
+        name: "video-a",
+        kinds: ["video"],
+        tasks: ["image-to-video"],
+        available: true,
+      },
+    ])
+    expect(result.groups.video).toEqual(["video-a"])
+  })
+
+  test("magpie tools route through the local gateway with provider-prefixed models", async () => {
+    _internal.catalogCache.items = catalog
+    _internal.catalogCache.base = "https://opencsg.com/aigateway/v1"
+    _internal.catalogCache.at = Date.now()
+    let request
+    globalThis.fetch = async (input, init) => {
+      request = { url: String(input), init, headers: new Headers(init?.headers) }
+      return Response.json({ data: [{ url: "https://cdn.example/local.png" }] })
+    }
+
+    const tools = _internal.createToolDefinitions(_internal.magpieToolRuntime())
+    const result = await tools.opencsg_generate_image.execute({ prompt: "local route" }, {})
+
+    expect(request.url).toBe("http://127.0.0.1:3425/v1/images/generations")
+    expect(request.headers.get("authorization")).toBeNull()
+    expect(JSON.parse(request.init.body).model).toBe("opencsg/image-a")
+    expect(result.urls).toEqual(["https://cdn.example/local.png"])
+  })
+
+  test("follows magpie's configured gateway address", () => {
+    const previous = process.env.MAGPIE_ADDR
+    try {
+      process.env.MAGPIE_ADDR = "0.0.0.0:4999"
+      expect(_internal.magpieGatewayBase()).toBe("http://0.0.0.0:4999/v1")
+    } finally {
+      if (previous === undefined) delete process.env.MAGPIE_ADDR
+      else process.env.MAGPIE_ADDR = previous
+    }
+  })
+
+  test("generates images with dynamic model selection", async () => {
+    const transport = runtime({
+      "/images/generations": {
+        created: 1,
+        data: [{ url: "https://cdn.example/image.png" }],
+      },
+    })
+    const tools = _internal.createToolDefinitions(transport)
+    const result = await tools.opencsg_generate_image.execute(
+      { prompt: "a red fox", n: 2, size: "1024x1024" },
+      {},
+    )
+
+    expect(transport.calls[0]).toMatchObject({
+      path: "/images/generations",
+      options: {
+        body: {
+          model: "opencsg/image-a",
+          prompt: "a red fox",
+          n: 2,
+          size: "1024x1024",
+          response_format: "url",
+        },
+      },
+    })
+    expect(result).toMatchObject({
+      model: "image-a",
+      prompt: "a red fox",
+      urls: ["https://cdn.example/image.png"],
+    })
+  })
+
+  test("creates and reads asynchronous video jobs", async () => {
+    const transport = runtime({
+      "/videos": {
+        id: "video_job_1",
+        object: "video",
+        status: "queued",
+        model: "image-to-video-a",
+      },
+      "/videos/video_job_1": {
+        id: "video_job_1",
+        status: "completed",
+        model: "image-to-video-a",
+      },
+    })
+    const tools = _internal.createToolDefinitions(transport)
+    const created = await tools.opencsg_generate_video.execute(
+      { prompt: "waves", image_url: "https://example.com/start.png", seconds: 5 },
+      {},
+    )
+
+    expect(transport.calls[0]).toMatchObject({
+      path: "/videos",
+      options: {
+        body: {
+          model: "opencsg/video-a",
+          prompt: "waves",
+          seconds: 5,
+          input_reference: { image_url: "https://example.com/start.png" },
+        },
+      },
+    })
+    expect(created).toMatchObject({
+      id: "video_job_1",
+      status_url: "https://gateway.example/v1/videos/video_job_1",
+    })
+    expect(created.content_url).toBeUndefined()
+
+    const completed = await tools.opencsg_video_status.execute(
+      { video_id: "video_job_1" },
+      {},
+    )
+    expect(completed).toMatchObject({
+      id: "video_job_1",
+      status: "completed",
+      content_url: "https://gateway.example/v1/videos/video_job_1/content",
+    })
+  })
+
+  test("sends structured System One state and typed questions", async () => {
+    const transport = runtime({
+      "/systemone": {
+        id: "decision_1",
+        answers: { refund: { type: "noul", noul: 0.97 } },
+        usage: { input_tokens: 10, output_tokens: 2 },
+      },
+    })
+    const tools = _internal.createToolDefinitions(transport)
+    const result = await tools.opencsg_system_one.execute(
+      {
+        model: "decision-a",
+        state: { ticket: "charged twice", plan: "pro" },
+        questions: {
+          refund: { type: "noul", instructions: "Is the customer asking for money back?" },
+          intent: { type: "choice", instructions: "What do they want?", criteria: ["refund", "help"] },
+        },
+        temperature: 0.2,
+      },
+      {},
+    )
+
+    expect(transport.calls[0]).toMatchObject({
+      path: "/systemone",
+      options: {
+        body: {
+          model: "opencsg/decision-a",
+          state: { ticket: "charged twice", plan: "pro" },
+          temperature: 0.2,
+        },
+      },
+    })
+    expect(result.answers.refund.noul).toBe(0.97)
+    expect(() => _internal.systemOneBody({ state: "x", questions: {} })).toThrow(
+      "non-empty object",
+    )
+    expect(() =>
+      _internal.systemOneBody({ state: "x", questions: { intent: { type: "choice" } } }),
+    ).toThrow("criteria is required")
+  })
+})
+
 describe("markSignIn", () => {
   test("marks 401 and 403 responses as expired", async () => {
     for (const status of [401, 403]) {
@@ -336,8 +567,20 @@ describe("plugin hooks", () => {
       name: "OpenCSG",
       npm: "@ai-sdk/openai-compatible",
       api: "https://opencsg.com/aigateway/v1",
+      decide: true,
     })
     expect(Object.keys(cfg.provider.opencsg.models)).toEqual(["auto"])
+    expect(Object.keys(hooks.tool)).toEqual([
+      "opencsg_models",
+      "opencsg_generate_image",
+      "opencsg_generate_video",
+      "opencsg_video_status",
+      "opencsg_system_one",
+    ])
+    for (const tool of Object.values(hooks.tool)) {
+      expect(tool.args.type).toBe("object")
+      expect(typeof tool.execute).toBe("function")
+    }
   })
 
   test("models reads the public catalog without an account", async () => {
@@ -451,7 +694,7 @@ describe("plugin hooks", () => {
 
     expect(request.input).toBe("https://private.example/v1/chat/completions")
     expect(request.init.headers.get("authorization")).toBe("Bearer gw-sk-test")
-    expect(request.init.headers.get("x-opencsg-client")).toBe("opencsg-magpie/0.1.2")
+    expect(request.init.headers.get("x-opencsg-client")).toBe("opencsg-magpie/0.1.3")
     expect(request.init.headers.get("content-length")).toBeNull()
     expect(request.init.signal).toBe(signal)
     expect(res.headers.get("x-magpie-sign-in")).toBe("expired")
@@ -472,6 +715,7 @@ describe("OpenCode v2 plugin", () => {
       integrations: new Map(),
       methods: [],
       providers: new Map(),
+      tools: new Map(),
       transforms: 0,
       reloads: 0,
     }
@@ -506,6 +750,13 @@ describe("OpenCode v2 plugin", () => {
           },
           reload: async () => {
             state.reloads += 1
+          },
+        },
+        tool: {
+          transform: async (callback) => {
+            callback({
+              add: (tool) => state.tools.set(tool.name, tool),
+            })
           },
         },
         event: {
@@ -587,6 +838,17 @@ describe("OpenCode v2 plugin", () => {
       enabled: true,
       limit: { context: 128_000, output: 0 },
     })
+    expect([...state.tools.keys()]).toEqual([
+      "opencsg_models",
+      "opencsg_generate_image",
+      "opencsg_generate_video",
+      "opencsg_video_status",
+      "opencsg_system_one",
+    ])
+    expect(state.tools.get("opencsg_generate_image")).toMatchObject({
+      options: { codemode: false },
+      input: { type: "object" },
+    })
     expect(state.transforms).toBe(1)
   })
 
@@ -631,6 +893,55 @@ describe("OpenCode v2 plugin", () => {
     expect(`${runtime.baseURL}/chat/completions`).toBe(
       "https://private.example/aigateway/v1/chat/completions",
     )
+  })
+
+  test("tool calls use the active OpenCode credential without exposing it", async () => {
+    const connection = {
+      type: "credential",
+      id: "cred_1",
+      label: "Work",
+      method: "key",
+    }
+    const credential = {
+      type: "key",
+      key: "gw-sk-test",
+      configuration: { gateway: "https://private.example/aigateway" },
+    }
+    const calls = []
+    globalThis.fetch = async (input, init) => {
+      const url = new URL(String(input))
+      calls.push({ url, init, headers: new Headers(init?.headers) })
+      if (url.pathname.endsWith("/models")) {
+        return Response.json(
+          modelPage([{ id: "image-a", task: "text-to-image" }]),
+        )
+      }
+      if (url.pathname.endsWith("/images/generations")) {
+        return Response.json({ data: [{ url: "https://cdn.example/a.png" }] })
+      }
+      throw new Error(`unexpected request ${url}`)
+    }
+
+    const { ctx, state } = context({ connection, credential })
+    const cleanup = await OpenCodePlugin.setup(ctx)
+    const result = await state.tools.get("opencsg_generate_image").execute(
+      { prompt: "a lighthouse" },
+      { signal: new AbortController().signal },
+    )
+    await cleanup()
+
+    const imageCall = calls.find((call) => call.url.pathname.endsWith("/images/generations"))
+    expect(imageCall.url.href).toBe(
+      "https://private.example/aigateway/v1/images/generations",
+    )
+    expect(imageCall.headers.get("authorization")).toBe("Bearer gw-sk-test")
+    expect(JSON.parse(imageCall.init.body)).toMatchObject({
+      model: "image-a",
+      prompt: "a lighthouse",
+      response_format: "url",
+    })
+    expect(result.output).not.toContain("gw-sk-test")
+    expect(JSON.parse(result.output).urls).toEqual(["https://cdn.example/a.png"])
   })
 
   test("keeps the provider visible and rebases retained models when discovery fails", async () => {

@@ -17,10 +17,21 @@ const DEFAULT_IAM_CALLBACK = "https://opencsg.com/api/v1/callback/casdoor"
 const NPM = "@ai-sdk/openai-compatible"
 const OPENCODE_NPM = "@opencode/ai/providers/openai-compatible"
 const PLUGIN_ID = "magpie-opencsg-auth"
-const CLIENT_HEADER = "opencsg-magpie/0.1.2"
+const CLIENT_HEADER = "opencsg-magpie/0.1.3"
 const TIMEOUT_MS = 20_000
+const TOOL_TIMEOUT_MS = 45_000
 const OAUTH_TIMEOUT_MS = 10 * 60_000
 const MAX_PAGES = 20
+const DEFAULT_MAGPIE_GATEWAY = "http://127.0.0.1:3425/v1"
+
+const IMAGE_TASKS = new Set(["text-to-image", "image-to-image"])
+const VIDEO_TASKS = new Set([
+  "text-to-video",
+  "text-to-video-synthesis",
+  "image-to-video",
+  "audio-text-to-video",
+  "audio-image-text-to-video",
+])
 
 // A conservative fallback used before the live list can be read. The gateway
 // exposes many more models; provider.models replaces this list when live data
@@ -32,6 +43,15 @@ const FALLBACK_MODELS = {
     tool_call: true,
     modalities: { input: ["text"], output: ["text"] },
   },
+}
+
+// magpie's provider hook can read the account's full OpenCSG catalog. Tool
+// calls run later, in the same plugin process, so keep that catalog here to
+// avoid asking for a credential the tool hook does not receive.
+const catalogCache = {
+  base: "",
+  items: [],
+  at: 0,
 }
 
 const isObject = (v) => v !== null && typeof v === "object" && !Array.isArray(v)
@@ -75,6 +95,15 @@ function modelsURL(base) {
   return `${base}/models?page=1&per=100`
 }
 
+function magpieGatewayBase() {
+  const configured = text(process.env.MAGPIE_GATEWAY_URL)
+  if (configured) return normalizeBase(configured)
+  const address = text(process.env.MAGPIE_ADDR)
+  if (!address) return DEFAULT_MAGPIE_GATEWAY
+  const url = /^https?:\/\//i.test(address) ? address : `http://${address}`
+  return normalizeBase(url)
+}
+
 function safeJSON(value) {
   try {
     return JSON.parse(value)
@@ -83,8 +112,7 @@ function safeJSON(value) {
   }
 }
 
-async function responseError(res) {
-  const body = await res.text().catch(() => "")
+function responseErrorFromBody(res, body) {
   const parsed = safeJSON(body)
   const message =
     text(parsed?.error?.message) ||
@@ -95,6 +123,45 @@ async function responseError(res) {
     res.statusText ||
     "request failed"
   return `OpenCSG answered ${res.status}: ${message}`
+}
+
+async function responseError(res) {
+  return responseErrorFromBody(res, await res.text().catch(() => ""))
+}
+
+function requestSignal(signal, timeout = TOOL_TIMEOUT_MS) {
+  const deadline = AbortSignal.timeout(timeout)
+  return signal ? AbortSignal.any([signal, deadline]) : deadline
+}
+
+async function apiRequest(base, key, path, options = {}) {
+  const headers = new Headers(options.headers ?? {})
+  headers.set("Accept", headers.get("Accept") ?? "application/json")
+  headers.set("X-OpenCSG-Client", CLIENT_HEADER)
+  if (key) headers.set("Authorization", `Bearer ${key}`)
+
+  let body
+  if (options.body !== undefined) {
+    headers.set("Content-Type", "application/json")
+    body = JSON.stringify(options.body)
+  }
+
+  const res = await fetch(`${normalizeBase(base)}${path}`, {
+    method: options.method ?? (body === undefined ? "GET" : "POST"),
+    headers,
+    body,
+    signal: requestSignal(options.signal, options.timeout),
+  })
+  const raw = await res.text().catch(() => "")
+  if (!res.ok) throw new Error(responseErrorFromBody(res, raw))
+  if (!raw) return undefined
+
+  const parsed = safeJSON(raw)
+  if (parsed !== undefined) return parsed
+  if ((res.headers.get("Content-Type") ?? "").includes("application/json")) {
+    throw new Error("OpenCSG answered with malformed JSON")
+  }
+  return raw
 }
 
 async function validateKey(base, key, signal) {
@@ -350,9 +417,50 @@ function tasksOf(model) {
   return tasks
 }
 
+function isDecisionModel(model) {
+  const tasks = tasksOf(model)
+  if (
+    tasks.has("typed-decisions") ||
+    tasks.has("decision-model") ||
+    tasks.has("systemone") ||
+    tasks.has("system-one")
+  ) {
+    return true
+  }
+  return tasks.has("decision") && !tasks.has("text-generation")
+}
+
+function isImageModel(model) {
+  const tasks = tasksOf(model)
+  return [...tasks].some((task) => IMAGE_TASKS.has(task))
+}
+
+function isVideoModel(model) {
+  const tasks = tasksOf(model)
+  return [...tasks].some((task) => VIDEO_TASKS.has(task))
+}
+
 function supportsChat(model) {
   const tasks = tasksOf(model)
+  if (isDecisionModel(model) || isImageModel(model) || isVideoModel(model)) return false
   return tasks.size === 0 || tasks.has("text-generation") || tasks.has("image-text-to-text")
+}
+
+function modelKind(model) {
+  if (isDecisionModel(model)) return "decision"
+  if (isImageModel(model)) return "image"
+  if (isVideoModel(model)) return "video"
+  if (supportsChat(model)) return "chat"
+  return undefined
+}
+
+function modelKinds(model) {
+  const out = []
+  if (isDecisionModel(model)) out.push("decision")
+  if (isImageModel(model)) out.push("image")
+  if (isVideoModel(model)) out.push("video")
+  if (supportsChat(model)) out.push("chat")
+  return out
 }
 
 function pricingOf(model) {
@@ -387,13 +495,19 @@ function labelOf(id) {
 function modelOf(item, provider) {
   const id = text(item?.id)
   const tasks = tasksOf(item)
-  const images = tasks.has("image-text-to-text") || item?.metadata?.is_vision_model === true
-  const toolCall = item?.support_function_call === true
+  const kind = modelKind(item)
+  const images =
+    tasks.has("image-text-to-text") ||
+    tasks.has("image-to-image") ||
+    item?.metadata?.is_vision_model === true
+  const output =
+    kind === "image" ? ["image"] : kind === "video" ? ["video"] : ["text"]
+  const toolCall = kind === "chat" && item?.support_function_call === true
   const available = item?.availability?.is_available !== false
   const previous = provider?.models?.[id] ?? {}
   const name = text(item?.name) || text(item?.metadata?.display_name) || labelOf(id)
   const context = positive(item?.context_length) ?? positive(item?.metadata?.context_length) ?? previous.limit?.context ?? 0
-  const output =
+  const outputLimit =
     positive(item?.max_output_tokens) ??
     positive(item?.metadata?.max_output_tokens) ??
     positive(previous.limit?.output) ??
@@ -405,18 +519,24 @@ function modelOf(item, provider) {
     id,
     name,
     api: { id, npm: NPM },
-    limit: { context, output },
+    limit: { context, output: outputLimit },
     tool_call: toolCall,
     attachment: images,
-    modalities: { input: images ? ["text", "image"] : ["text"], output: ["text"] },
+    modalities: { input: images ? ["text", "image"] : ["text"], output },
     capabilities: {
-      temperature: true,
+      temperature: kind === "chat",
       reasoning: false,
       toolcall: toolCall,
       attachment: images,
       input: { text: true, image: images },
-      output: { text: true },
+      output: {
+        text: output.includes("text"),
+        image: output.includes("image"),
+        video: output.includes("video"),
+      },
     },
+    ...(kind ? { kind } : {}),
+    ...(kind === "decision" ? { decides: true } : {}),
     ...(pricing ? { cost: pricing } : {}),
     ...(available ? {} : { status: "deprecated" }),
   }
@@ -426,11 +546,441 @@ function modelOf(item, provider) {
 function liveModels(items, provider) {
   const models = {}
   for (const item of items) {
-    if (!supportsChat(item)) continue
+    if (!modelKind(item)) continue
     const m = modelOf(item, provider)
     if (m.id) models[m.id] = m
   }
   return models
+}
+
+function withoutProvider(id) {
+  const value = text(id)
+  const prefix = `${PROVIDER}/`
+  return value.startsWith(prefix) ? value.slice(prefix.length) : value
+}
+
+function modelIsAvailable(model) {
+  return model?.availability?.is_available !== false
+}
+
+function chooseModel(items, kind, requested) {
+  const wanted = withoutProvider(requested)
+  const usable = items.filter(modelIsAvailable)
+
+  if (wanted) {
+    const found = usable.find((item) => withoutProvider(item?.id) === wanted)
+    if (found) {
+      if (!modelKinds(found).includes(kind)) {
+        throw new Error(`OpenCSG model "${wanted}" is not a ${kind} model`)
+      }
+      return found
+    }
+    if (items.some((item) => withoutProvider(item?.id) === wanted)) {
+      throw new Error(`OpenCSG model "${wanted}" is currently unavailable`)
+    }
+    // A cached catalog can be older than the account's permissions. An
+    // explicitly named model is still sent through so the gateway decides.
+    if (items.length === 0) return { id: wanted }
+    const available = usable
+      .filter((item) => modelKinds(item).includes(kind))
+      .map((item) => text(item?.id))
+      .filter(Boolean)
+    throw new Error(
+      `OpenCSG model "${wanted}" is not in this account's catalog` +
+        (available.length ? `. Available ${kind} models: ${available.join(", ")}` : ""),
+    )
+  }
+
+  const found = usable.find((item) => modelKinds(item).includes(kind))
+  if (found) return found
+
+  throw new Error(
+    `No available OpenCSG ${kind} model was found in this account's catalog. ` +
+      "Ask an OpenCSG administrator for access, or pass model explicitly.",
+  )
+}
+
+function modelSummary(item) {
+  return {
+    id: text(item?.id),
+    name: text(item?.name) || text(item?.metadata?.display_name) || text(item?.id),
+    kinds: modelKinds(item),
+    tasks: [...tasksOf(item)],
+    available: modelIsAvailable(item),
+  }
+}
+
+function gatewayModelItem(model) {
+  const id = withoutProvider(model?.id)
+  const outputs = Array.isArray(model?.modalities?.output) ? model.modalities.output : []
+  let task = "text-generation"
+  if (model?.decides === true) task = "typed-decisions"
+  else if (outputs.includes("video")) task = "text-to-video"
+  else if (outputs.includes("image")) task = "text-to-image"
+  return {
+    id,
+    name: text(model?.display_name) || text(model?.name) || id,
+    task,
+    metadata: { tasks: [task] },
+    availability: { is_available: true },
+  }
+}
+
+function toolSignal(ctx, timeout = TOOL_TIMEOUT_MS) {
+  const outer = ctx?.abort ?? ctx?.signal
+  return requestSignal(outer, timeout)
+}
+
+function absoluteURL(connection, path) {
+  return `${normalizeBase(connection.baseURL)}${path}`
+}
+
+function videoResult(connection, result) {
+  const id = text(result?.id)
+  const status = text(result?.status)
+  return {
+    ...result,
+    ...(id && !text(result?.status_url)
+      ? { status_url: absoluteURL(connection, `/videos/${encodeURIComponent(id)}`) }
+      : {}),
+    ...(id && status === "completed" && !text(result?.content_url)
+      ? { content_url: absoluteURL(connection, `/videos/${encodeURIComponent(id)}/content`) }
+      : {}),
+  }
+}
+
+function systemOneBody(args) {
+  const state = args?.state
+  if (state === undefined || state === null) throw new Error("state is required")
+  if (typeof state === "string" && !state.trim()) throw new Error("state cannot be empty")
+  if (!isObject(args?.questions) || Object.keys(args.questions).length === 0) {
+    throw new Error("questions must be a non-empty object of named typed questions")
+  }
+
+  const questions = {}
+  for (const [name, question] of Object.entries(args.questions)) {
+    if (!isObject(question)) throw new Error(`questions.${name} must be an object`)
+    const type = text(question.type)
+    if (!type) throw new Error(`questions.${name}.type is required`)
+    if (type === "choice" && question.criteria === undefined) {
+      throw new Error(`questions.${name}.criteria is required for choice questions`)
+    }
+    questions[name] = question
+  }
+
+  return { state, questions }
+}
+
+async function toolCatalog(runtime, ctx, requestedModel) {
+  const signal = toolSignal(ctx)
+  const connection = await runtime.connection(signal)
+  try {
+    return { connection, items: await runtime.catalog(connection, signal) }
+  } catch (error) {
+    if (requestedModel) return { connection, items: [] }
+    throw new Error(
+      `Could not discover OpenCSG models. Sign in again or pass model explicitly. ${error.message}`,
+      { cause: error },
+    )
+  }
+}
+
+function createToolDefinitions(runtime) {
+  return {
+    opencsg_models: {
+      description:
+        "List OpenCSG models available to the signed-in account, grouped by chat, image, video and System One decision capability. Use this before choosing an optional media or decision model.",
+      args: {
+        type: "object",
+        properties: {
+          kind: {
+            type: "string",
+            enum: ["all", "chat", "image", "video", "decision"],
+            default: "all",
+          },
+        },
+        additionalProperties: false,
+      },
+      async execute(args, ctx) {
+        const kind = text(args?.kind) || "all"
+        if (!["all", "chat", "image", "video", "decision"].includes(kind)) {
+          throw new Error("kind must be all, chat, image, video or decision")
+        }
+        const signal = toolSignal(ctx)
+        const connection = await runtime.connection(signal)
+        const items = await runtime.catalog(connection, signal)
+        const selected = items.filter(
+          (item) => modelKinds(item).length && (kind === "all" || modelKinds(item).includes(kind)),
+        )
+        const groups = { chat: [], image: [], video: [], decision: [] }
+        for (const item of selected) {
+          for (const capability of modelKinds(item)) groups[capability].push(text(item.id))
+        }
+        return {
+          kind,
+          models: selected.map(modelSummary),
+          groups,
+        }
+      },
+    },
+
+    opencsg_generate_image: {
+      description:
+        "Generate image URLs with OpenCSG's /images/generations endpoint. When model is omitted, the first available text-to-image model in the account catalog is used.",
+      args: {
+        type: "object",
+        properties: {
+          prompt: { type: "string", minLength: 1 },
+          model: { type: "string", description: "Optional text-to-image model ID." },
+          n: { type: "integer", minimum: 1, maximum: 10 },
+          size: { type: "string", description: "Provider size such as 1024x1024." },
+          response_format: { type: "string", enum: ["url", "b64_json"], default: "url" },
+        },
+        required: ["prompt"],
+        additionalProperties: false,
+      },
+      async execute(args, ctx) {
+        const prompt = text(args?.prompt)
+        if (!prompt) throw new Error("prompt is required")
+        const { connection, items } = await toolCatalog(runtime, ctx, args?.model)
+        const model = chooseModel(items, "image", args?.model)
+        const body = {
+          model: runtime.modelName(connection, model.id),
+          prompt,
+          response_format: text(args?.response_format) || "url",
+        }
+        if (args?.n !== undefined) {
+          if (!Number.isInteger(args.n) || args.n < 1 || args.n > 10) {
+            throw new Error("n must be an integer from 1 to 10")
+          }
+          body.n = args.n
+        }
+        if (text(args?.size)) body.size = text(args.size)
+
+        const response = await runtime.request(connection, "/images/generations", {
+          body,
+          signal: toolSignal(ctx),
+        })
+        const images = Array.isArray(response?.data) ? response.data : []
+        const urls = images.map((image) => text(image?.url) || text(image?.b64_json)).filter(Boolean)
+        if (!images.length) throw new Error("OpenCSG returned no image data")
+        return {
+          model: withoutProvider(model.id),
+          prompt,
+          ...(body.n ? { n: body.n } : {}),
+          ...(body.size ? { size: body.size } : {}),
+          response_format: body.response_format,
+          urls,
+          images,
+        }
+      },
+    },
+
+    opencsg_generate_video: {
+      description:
+        "Create an asynchronous OpenCSG video generation with /videos. Returns the job ID and status URLs; poll with opencsg_video_status. An optional input image enables image-to-video models.",
+      args: {
+        type: "object",
+        properties: {
+          prompt: { type: "string", minLength: 1 },
+          model: { type: "string", description: "Optional text-to-video or image-to-video model ID." },
+          size: { type: "string", description: "Provider size such as 1280x720." },
+          seconds: { type: "integer", minimum: 1, maximum: 60 },
+          image_url: { type: "string", description: "Input image URL for image-to-video." },
+          file_id: { type: "string", description: "OpenCSG uploaded-file ID for image-to-video." },
+        },
+        required: ["prompt"],
+        additionalProperties: false,
+      },
+      async execute(args, ctx) {
+        const prompt = text(args?.prompt)
+        if (!prompt) throw new Error("prompt is required")
+        const imageURL = text(args?.image_url)
+        const fileID = text(args?.file_id)
+        if (imageURL && fileID) throw new Error("Use image_url or file_id, not both")
+
+        const { connection, items } = await toolCatalog(runtime, ctx, args?.model)
+        const model = chooseModel(items, "video", args?.model)
+        const body = { model: runtime.modelName(connection, model.id), prompt }
+        if (text(args?.size)) body.size = text(args.size)
+        if (args?.seconds !== undefined) {
+          if (!Number.isInteger(args.seconds) || args.seconds < 1 || args.seconds > 60) {
+            throw new Error("seconds must be an integer from 1 to 60")
+          }
+          body.seconds = args.seconds
+        }
+        if (imageURL || fileID) {
+          body.input_reference = imageURL ? { image_url: imageURL } : { file_id: fileID }
+        }
+
+        const response = await runtime.request(connection, "/videos", {
+          body,
+          signal: toolSignal(ctx),
+        })
+        return {
+          model: withoutProvider(model.id),
+          ...videoResult(connection, response),
+        }
+      },
+    },
+
+    opencsg_video_status: {
+      description:
+        "Read one OpenCSG video generation job. When status is completed, content_url points at the generated video; failed and cancelled jobs include the gateway error.",
+      args: {
+        type: "object",
+        properties: {
+          video_id: { type: "string", minLength: 1 },
+        },
+        required: ["video_id"],
+        additionalProperties: false,
+      },
+      async execute(args, ctx) {
+        const videoID = text(args?.video_id)
+        if (!videoID) throw new Error("video_id is required")
+        const signal = toolSignal(ctx)
+        const connection = await runtime.connection(signal)
+        const response = await runtime.request(
+          connection,
+          `/videos/${encodeURIComponent(videoID)}`,
+          { signal },
+        )
+        return videoResult(connection, response)
+      },
+    },
+
+    opencsg_system_one: {
+      description:
+        "Ask a typed decision model through OpenCSG's System One /systemone endpoint. Questions may use noul, choice or score; choice questions require criteria. The response contains answers and usage.",
+      args: {
+        type: "object",
+        properties: {
+          state: {
+            description: "The situation to evaluate: a string, object, array or other JSON value.",
+          },
+          questions: {
+            type: "object",
+            minProperties: 1,
+            additionalProperties: {
+              type: "object",
+              properties: {
+                type: {
+                  type: "string",
+                  description: "Question type, usually noul, choice or score.",
+                },
+                instructions: { description: "Instructions for this question. Any JSON value." },
+                criteria: {
+                  description: "Type-specific criteria; choice questions require this.",
+                },
+              },
+              required: ["type"],
+              additionalProperties: true,
+            },
+          },
+          model: { type: "string", description: "Optional System One decision model ID." },
+          temperature: { type: "number", minimum: 0, maximum: 2 },
+        },
+        required: ["state", "questions"],
+        additionalProperties: false,
+      },
+      async execute(args, ctx) {
+        const body = systemOneBody(args)
+        const { connection, items } = await toolCatalog(runtime, ctx, args?.model)
+        const model = chooseModel(items, "decision", args?.model)
+        const payload = {
+          model: runtime.modelName(connection, model.id),
+          ...body,
+        }
+        if (args?.temperature !== undefined) {
+          if (!Number.isFinite(args.temperature) || args.temperature < 0 || args.temperature > 2) {
+            throw new Error("temperature must be a number from 0 to 2")
+          }
+          payload.temperature = args.temperature
+        }
+        const response = await runtime.request(connection, "/systemone", {
+          body: payload,
+          signal: toolSignal(ctx),
+        })
+        if (!isObject(response?.answers)) {
+          throw new Error("OpenCSG System One response did not include answers")
+        }
+        return { model: withoutProvider(model.id), ...response }
+      },
+    },
+  }
+}
+
+async function openCodeCredential(ctx) {
+  const connection = await ctx.integration?.connection?.active?.(PROVIDER)
+  if (!connection) throw new Error("Sign in to OpenCSG before using its tools")
+  const credential = await ctx.integration.connection.resolve(connection).catch(() => undefined)
+  const auth = credentialAuth(credential)
+  if (!auth?.key) throw new Error("OpenCSG credentials do not contain an AI Gateway key")
+  return auth
+}
+
+function magpieToolRuntime() {
+  const baseURL = magpieGatewayBase()
+  return {
+    async connection() {
+      return { baseURL, key: "" }
+    },
+    async catalog(connection, signal) {
+      if (catalogCache.items.length && Date.now() - catalogCache.at < 10 * 60_000) {
+        return catalogCache.items
+      }
+      const body = await apiRequest(connection.baseURL, "", "/models", {
+        signal,
+        timeout: TIMEOUT_MS,
+      })
+      const items = (Array.isArray(body?.data) ? body.data : [])
+        .filter((model) => text(model?.owned_by) === PROVIDER || text(model?.id).startsWith(`${PROVIDER}/`))
+        .map(gatewayModelItem)
+        .filter((model) => modelKinds(model).length)
+      return items
+    },
+    modelName(_connection, id) {
+      const value = withoutProvider(id)
+      return value.startsWith(`${PROVIDER}/`) ? value : `${PROVIDER}/${value}`
+    },
+    request(connection, path, options) {
+      return apiRequest(connection.baseURL, "", path, options)
+    },
+  }
+}
+
+function openCodeToolRuntime(ctx) {
+  return {
+    connection: () => openCodeCredential(ctx),
+    catalog(connection, signal) {
+      return readModels(connection.baseURL, connection.key, signal)
+    },
+    modelName(_connection, id) {
+      return withoutProvider(id)
+    },
+    request(connection, path, options) {
+      return apiRequest(connection.baseURL, connection.key, path, options)
+    },
+  }
+}
+
+function openCodeTools(ctx) {
+  const definitions = createToolDefinitions(openCodeToolRuntime(ctx))
+  return Object.fromEntries(
+    Object.entries(definitions).map(([name, definition]) => [
+      name,
+      {
+        description: definition.description,
+        options: { codemode: false },
+        input: definition.args,
+        async execute(args, toolContext) {
+          const result = await definition.execute(args, toolContext)
+          const output = typeof result === "string" ? result : JSON.stringify(result)
+          return { content: output, output }
+        },
+      },
+    ]),
+  )
 }
 
 function signedIn(auth) {
@@ -669,6 +1219,13 @@ async function openCodeSetup(ctx) {
     editor.method.update(openCodeOAuth())
   })
 
+  if (typeof ctx.tool?.transform === "function") {
+    const tools = openCodeTools(ctx)
+    await ctx.tool.transform((editor) => {
+      for (const [name, tool] of Object.entries(tools)) editor.add({ name, ...tool })
+    })
+  }
+
   // Register the transform once. Credential events update the captured snapshot
   // and reload the provider registry instead of stacking duplicate transforms.
   await ctx.provider.transform((editor) => {
@@ -724,6 +1281,8 @@ export const OpenCSGAuthPlugin = async ({ client } = {}) => {
         api: DEFAULT_BASE,
         models: FALLBACK_MODELS,
       }
+      cfg.provider[PROVIDER].decide = true
+      cfg.provider[PROVIDER].models ??= FALLBACK_MODELS
     },
 
     auth: {
@@ -817,14 +1376,17 @@ export const OpenCSGAuthPlugin = async ({ client } = {}) => {
 
     provider: {
       id: PROVIDER,
-      async models(provider, { auth } = {}) {
+      async models(provider, { auth, signal } = {}) {
         // The public model catalog is readable without a key. Use a signed-in
         // account (and its custom gateway) when one exists, but do not require
         // one just to show what OpenCSG offers.
         const key = signedIn(auth) ? auth.key : ""
         const base = signedIn(auth) ? gatewayOf(auth) : DEFAULT_BASE
         try {
-          const items = await readModels(base, key)
+          const items = await readModels(base, key, signal)
+          catalogCache.base = base
+          catalogCache.items = items
+          catalogCache.at = Date.now()
           const live = liveModels(items, provider)
           return Object.keys(live).length ? { ...provider.models, ...live } : provider.models
         } catch (e) {
@@ -835,6 +1397,8 @@ export const OpenCSGAuthPlugin = async ({ client } = {}) => {
         }
       },
     },
+
+    tool: createToolDefinitions(magpieToolRuntime()),
   }
 }
 
@@ -843,13 +1407,23 @@ export const _internal = {
   PROVIDER,
   DEFAULT_BASE,
   FALLBACK_MODELS,
+  DEFAULT_MAGPIE_GATEWAY,
   OpenCodePlugin,
+  apiRequest,
+  catalogCache,
+  chooseModel,
+  createToolDefinitions,
   credentialAuth,
+  modelKind,
+  modelKinds,
   openCodeModel,
   openCodeModels,
   openCodeProvider,
   openCodeOAuth,
   openCodeSetup,
+  openCodeTools,
+  magpieGatewayBase,
+  magpieToolRuntime,
   plugin: OpenCSGAuthPlugin,
   normalizeBase,
   portalOf,
@@ -867,4 +1441,7 @@ export const _internal = {
   modelOf,
   liveModels,
   markSignIn,
+  systemOneBody,
+  videoResult,
+  withoutProvider,
 }

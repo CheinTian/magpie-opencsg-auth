@@ -10,9 +10,13 @@ OpenCSG AI Gateway provider for **OpenCode v2** and **magpie**.
 ## Features
 
 - Uses the OpenAI-compatible OpenCSG AI Gateway.
-- Discovers the signed-in account's chat models from `GET /v1/models`.
+- Discovers the signed-in account's chat, image, video and System One decision
+  models from `GET /v1/models`.
 - Supports text and image-input models, tool calls, context limits and price
   metadata when OpenCSG publishes them.
+- Generates images through `/images/generations`.
+- Creates and polls asynchronous video jobs through `/videos`.
+- Answers typed questions through the System One `/systemone` endpoint.
 - Supports private CSGHub / OpenCSG deployments through a custom gateway URL.
 - Exchanges an OpenCSG browser login for an AI Gateway key automatically; the
   short-lived CSGHub JWT is not stored.
@@ -93,6 +97,53 @@ In the TUI, open `/models` and select an `OpenCSG` model instead. After the
 plugin has loaded, you can normally omit `--standalone`; it is useful for
 testing a newly installed plugin against a fresh local server.
 
+### Image, video and System One tools
+
+OpenCode model selection stays focused on chat models. Media and decision
+models are exposed as tools instead of being sent to `/chat/completions`:
+
+- `opencsg_models` lists the account's chat, image, video and decision models.
+- `opencsg_generate_image` calls OpenCSG image generation.
+- `opencsg_generate_video` creates an asynchronous video job.
+- `opencsg_video_status` reads a job and returns its content URL when ready.
+- `opencsg_system_one` submits state plus named typed questions.
+
+All tools discover model IDs dynamically. When `model` is omitted, the first
+available model with the required task is used. If the account has no image,
+video or System One model, the tool returns an explicit error instead of
+inventing a model ID.
+
+Image generation example:
+
+```text
+Use opencsg_generate_image with prompt "a paper-cut lighthouse at dusk"
+```
+
+Video generation is asynchronous. The create tool returns `id`, `status_url`
+and, once complete, `content_url`. Poll with `opencsg_video_status` rather than
+resubmitting the prompt. Direct OpenCSG content URLs require the same API key as
+the gateway.
+
+System One questions may use `noul`, `choice` or `score`. `choice` requires
+`criteria`; `state` may be a string or structured JSON:
+
+```json
+{
+  "state": { "ticket": "I was charged twice", "plan": "pro" },
+  "questions": {
+    "refund": {
+      "type": "noul",
+      "instructions": "Is the customer asking for money back?"
+    },
+    "intent": {
+      "type": "choice",
+      "instructions": "What do they want?",
+      "criteria": ["refund", "technical help", "cancel"]
+    }
+  }
+}
+```
+
 ### Custom gateway
 
 For a private CSGHub / OpenCSG deployment, enter its gateway URL during login.
@@ -113,6 +164,7 @@ The deployment must expose OpenAI-compatible `/models` and
 magpie plugin add github:CheinTian/magpie-opencsg-auth
 magpie plugin login opencsg oauth
 magpie plugin
+magpie tools
 magpie provider test opencsg
 ```
 
@@ -125,11 +177,25 @@ magpie plugin add ./magpie-opencsg-auth
 For API-key login, choose the API-key method instead of `oauth`. The optional
 gateway prompt accepts the same URL forms described above.
 
+The plugin registers `opencsg_models`, `opencsg_generate_image`,
+`opencsg_generate_video`, `opencsg_video_status` and `opencsg_system_one` for
+every magpie agent. magpie prefixes these with the plugin name in its tool
+list. Media tools call magpie's local gateway, so the OpenCSG account remains in
+magpie's credential store and is never copied into tool arguments.
+
 ## Model discovery
 
-The plugin reads the live OpenCSG model catalog. It exposes text-generation and
-image-text-to-text chat models; embedding, rerank, speech and image-generation
-tasks are skipped.
+The plugin reads the live OpenCSG model catalog and classifies models by task:
+
+- `text-generation` and `image-text-to-text` are chat models.
+- `text-to-image` and `image-to-image` are image models.
+- `text-to-video`, `image-to-video` and related tasks are video models.
+- `typed-decisions` is a System One decision model.
+
+Embedding, rerank and speech tasks remain outside this provider. OpenCode's
+chat model picker only includes chat models; the image, video and System One
+tools use the wider catalog. magpie's provider registry receives all four
+classes with the matching output modality or decision flag.
 
 If OpenCSG does not publish context or output limits, the plugin leaves them at
 `0` instead of inventing values. Prices are converted from CNY per million
