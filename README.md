@@ -9,7 +9,11 @@ OpenCSG AI Gateway provider for **OpenCode v2** and **magpie**.
 
 ## Features
 
-- Uses the OpenAI-compatible OpenCSG AI Gateway.
+- Advertises effective models on Chat Completions, Anthropic Messages and
+  OpenAI Responses, so magpie shows a per-key protocol selector and can route
+  each agent's native request format.
+- Supports a configurable System One URL, defaulting to the gateway's `/v1`
+  base, and reports the active endpoints from `opencsg_models`.
 - Discovers the signed-in account's chat, image, video and System One decision
   models from `GET /v1/models`.
 - Supports text and image-input models, tool calls, context limits and price
@@ -17,7 +21,8 @@ OpenCSG AI Gateway provider for **OpenCode v2** and **magpie**.
 - Generates images through `/images/generations`.
 - Creates and polls asynchronous video jobs through `/videos`.
 - Answers typed questions through the System One `/systemone` endpoint.
-- Supports private CSGHub / OpenCSG deployments through a custom gateway URL.
+- Supports private CSGHub / OpenCSG deployments through a custom gateway URL,
+  including deriving the equivalent protocol endpoints from that URL.
 - Exchanges an OpenCSG browser login for an AI Gateway key automatically; the
   short-lived CSGHub JWT is not stored.
 - Marks credentials as expired on `401` / `403`, so OpenCode can prompt for a
@@ -156,7 +161,9 @@ https://ai-gateway.example.com/aigateway/v1
 ```
 
 The deployment must expose OpenAI-compatible `/models` and
-`/chat/completions` endpoints, including streaming.
+`/chat/completions` endpoints, including streaming. Anthropic Messages,
+Responses and System One are advertised when the deployment also exposes their
+corresponding endpoints.
 
 ## Use in magpie
 
@@ -175,7 +182,56 @@ magpie plugin add ./magpie-opencsg-auth
 ```
 
 For API-key login, choose the API-key method instead of `oauth`. The optional
-gateway prompt accepts the same URL forms described above.
+gateway prompt accepts the same URL forms described above. The optional
+**System One URL** prompt accepts either its `/v1` base or the full
+`/systemone` URL; leave it empty to use the gateway base.
+
+### Endpoints and protocol switching
+
+The provider derives these endpoints:
+
+- **OpenAI / Chat Completions** (`chat`)
+- **Anthropic Messages** (`anthropic`)
+- **OpenAI Responses** (`responses`)
+- **System One** (`decide`)
+
+For the public gateway the defaults are
+`https://opencsg.com/aigateway/v1` for Chat Completions, Responses and System
+One, and `https://opencsg.com/aigateway` for Anthropic Messages. Custom gateway
+URLs are normalized and the same endpoints are derived automatically. Existing
+config values are preserved.
+
+Every chat model is advertised to magpie on all three conversation protocols.
+That makes magpie's protocol selector appear beside each key and lets requests
+arrive as Chat Completions, Anthropic Messages or OpenAI Responses. The plugin
+forwards them to the same normalized gateway base. The `opencsg_models` tool
+includes an `endpoints` object with the actual Chat, Anthropic, Responses and
+System One URLs in use.
+
+System One is enabled with the boolean `decide: true` that magpie's plugin host
+expects; `decideURL` keeps the chosen endpoint. At sign-in, the **System One
+URL** prompt can point System One at another gateway host. Existing sign-ins
+derive it from their gateway automatically, and older `decide: true` values
+continue to work.
+
+> magpie's plugin-provider editor currently exposes the protocol selector but
+> does not provide free-form endpoint fields for plugin-backed providers. Use
+> the sign-in prompts, or edit the provider configuration below, to change a
+> URL. Custom providers created directly in magpie retain magpie's native
+> endpoint editor.
+
+The equivalent provider configuration is:
+
+```json
+{
+  "chat": "https://opencsg.com/aigateway/v1",
+  "anthropic": "https://opencsg.com/aigateway",
+  "responses": "https://opencsg.com/aigateway/v1",
+  "decide": true,
+  "decideURL": "https://opencsg.com/aigateway/v1",
+  "baseAPI": "chat"
+}
+```
 
 The plugin registers `opencsg_models`, `opencsg_generate_image`,
 `opencsg_generate_video`, `opencsg_video_status` and `opencsg_system_one` for

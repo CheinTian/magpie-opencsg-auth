@@ -53,7 +53,20 @@ for (const [name, fn] of fns) {
     if (!p?.npm || !p?.models || !Object.keys(p.models).length) {
       problems.push(`${name}: config gives ${auth.provider} no npm or models`)
     }
+    if (!p?.chat) problems.push(`${name}: provider has no Chat Completions endpoint`)
+    if (!p?.anthropic) problems.push(`${name}: provider has no Anthropic endpoint`)
+    if (!p?.responses) problems.push(`${name}: provider has no Responses endpoint`)
     if (p?.decide !== true) problems.push(`${name}: provider does not enable System One`)
+    if (!p?.decideURL) problems.push(`${name}: provider has no System One endpoint`)
+    if (!p?.baseAPI) problems.push(`${name}: provider has no default protocol`)
+    for (const model of Object.values(p?.models ?? {})) {
+      if (!Array.isArray(model?.also) || !model.also.includes("@ai-sdk/anthropic")) {
+        problems.push(`${name}: a model does not advertise Anthropic Messages`)
+      }
+      if (!model.also.includes("@ai-sdk/openai")) {
+        problems.push(`${name}: a model does not advertise OpenAI Responses`)
+      }
+    }
   }
   for (const tool of expectedTools) {
     const def = hooks.tool?.[tool]

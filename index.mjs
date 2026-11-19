@@ -15,9 +15,13 @@ const DEFAULT_IAM_AUTHORIZE = "https://iam.opencsg.com/login/oauth/authorize"
 const DEFAULT_IAM_CLIENT_ID = "d623c957e69976c8a7a8"
 const DEFAULT_IAM_CALLBACK = "https://opencsg.com/api/v1/callback/casdoor"
 const NPM = "@ai-sdk/openai-compatible"
+// magpie reads these AI SDK package names as the other native protocols a
+// plugin model serves. Advertising them lets magpie offer per-key protocol
+// selection and relay Anthropic Messages / Responses requests as sent.
+const ALTERNATE_PROTOCOLS = ["@ai-sdk/anthropic", "@ai-sdk/openai"]
 const OPENCODE_NPM = "@opencode/ai/providers/openai-compatible"
 const PLUGIN_ID = "magpie-opencsg-auth"
-const CLIENT_HEADER = "opencsg-magpie/0.1.3"
+const CLIENT_HEADER = "opencsg-magpie/0.1.4"
 const TIMEOUT_MS = 20_000
 const TOOL_TIMEOUT_MS = 45_000
 const OAUTH_TIMEOUT_MS = 10 * 60_000
@@ -42,6 +46,7 @@ const FALLBACK_MODELS = {
     limit: { context: 200_000, output: 32_000 },
     tool_call: true,
     modalities: { input: ["text"], output: ["text"] },
+    also: ALTERNATE_PROTOCOLS,
   },
 }
 
@@ -50,8 +55,15 @@ const FALLBACK_MODELS = {
 // avoid asking for a credential the tool hook does not receive.
 const catalogCache = {
   base: "",
+  endpoints: undefined,
   items: [],
   at: 0,
+}
+
+// The config hook runs before the auth loader in magpie's host. Keep the
+// configured System One URL for credentials that predate the sign-in prompt.
+const endpointSettings = {
+  systemOneURL: "",
 }
 
 const isObject = (v) => v !== null && typeof v === "object" && !Array.isArray(v)
@@ -81,6 +93,81 @@ function normalizeBase(value) {
   url.search = ""
   url.hash = ""
   return url.toString().replace(/\/$/, "")
+}
+
+function protocolEndpoints(gateway = DEFAULT_BASE) {
+  const chat = normalizeBase(gateway)
+  return {
+    chat,
+    // Anthropic SDKs append /v1/messages to their base URL.
+    anthropic: chat.replace(/\/v1$/i, ""),
+    // OpenAI Responses and System One both use the gateway's /v1 base.
+    responses: chat,
+    decide: chat,
+  }
+}
+
+function normalizeSystemOne(value, gateway = DEFAULT_BASE) {
+  const raw = text(value)
+  if (!raw) return protocolEndpoints(gateway).decide
+
+  let url
+  try {
+    url = new URL(raw)
+  } catch {
+    throw new Error("System One URL must be an absolute http(s) URL")
+  }
+  if (url.protocol !== "https:" && url.protocol !== "http:") {
+    throw new Error("System One URL must use http or https")
+  }
+
+  let path = url.pathname.replace(/\/+$/, "")
+  path = path.replace(/\/systemone$/i, "")
+  path = path.replace(/\/aigateway\/?$/i, "/aigateway/v1")
+  if (!/\/v1$/i.test(path)) path += "/v1"
+  url.pathname = path
+  url.search = ""
+  url.hash = ""
+  return url.toString().replace(/\/$/, "")
+}
+
+function availableEndpoints(gateway = DEFAULT_BASE, systemOne) {
+  return {
+    ...protocolEndpoints(gateway),
+    decide: normalizeSystemOne(systemOne, gateway),
+  }
+}
+
+function configureProviderEndpoints(provider) {
+  const current = text(provider.chat) || text(provider.api) || DEFAULT_BASE
+  let endpoints
+  try {
+    endpoints = protocolEndpoints(current)
+  } catch {
+    endpoints = protocolEndpoints(DEFAULT_BASE)
+  }
+
+  provider.api = text(provider.api) || endpoints.chat
+  provider.chat = text(provider.chat) || endpoints.chat
+  if (provider.anthropic === undefined) provider.anthropic = endpoints.anthropic
+  if (provider.responses === undefined) provider.responses = endpoints.responses
+  // magpie's plugin host enables System One only for the boolean `true`.
+  // Keep the endpoint beside it so it stays visible and editable rather than
+  // replacing the flag with a string the host would read as disabled.
+  const configuredSystemOne = text(provider.decide)
+  if (provider.decide === undefined || provider.decide === true || configuredSystemOne) {
+    const candidate = text(provider.decideURL) || configuredSystemOne || endpoints.decide
+    provider.decide = true
+    try {
+      provider.decideURL = normalizeSystemOne(candidate, endpoints.chat)
+    } catch {
+      provider.decideURL = endpoints.decide
+    }
+    endpointSettings.systemOneURL = provider.decideURL
+  } else {
+    endpointSettings.systemOneURL = ""
+  }
+  provider.baseAPI ||= "chat"
 }
 
 function gatewayOf(auth) {
@@ -223,12 +310,30 @@ const BASE_URL_PROMPT = {
   },
 }
 
+const SYSTEM_ONE_PROMPT = {
+  type: "text",
+  key: "systemOneURL",
+  message: "System One URL",
+  placeholder: DEFAULT_BASE,
+  validate: (value) => {
+    if (!text(value)) return undefined
+    try {
+      normalizeSystemOne(value)
+      return undefined
+    } catch (e) {
+      return e.message
+    }
+  },
+}
+
+const AUTH_PROMPTS = [BASE_URL_PROMPT, SYSTEM_ONE_PROMPT]
+
 function authMethod(type, label) {
   return {
     type,
     label,
     placeholder: type === "api" ? "gw-sk-…" : "",
-    prompts: [BASE_URL_PROMPT],
+    prompts: AUTH_PROMPTS,
   }
 }
 
@@ -535,6 +640,7 @@ function modelOf(item, provider) {
         video: output.includes("video"),
       },
     },
+    ...(kind === "chat" ? { also: ALTERNATE_PROTOCOLS } : {}),
     ...(kind ? { kind } : {}),
     ...(kind === "decision" ? { decides: true } : {}),
     ...(pricing ? { cost: pricing } : {}),
@@ -718,6 +824,7 @@ function createToolDefinitions(runtime) {
         }
         return {
           kind,
+          endpoints: runtime.endpoints?.(connection) ?? availableEndpoints(connection.baseURL),
           models: selected.map(modelSummary),
           groups,
         }
@@ -923,7 +1030,14 @@ function magpieToolRuntime() {
   const baseURL = magpieGatewayBase()
   return {
     async connection() {
-      return { baseURL, key: "" }
+      return {
+        baseURL,
+        key: "",
+        systemOneBase: catalogCache.endpoints?.decide,
+      }
+    },
+    endpoints() {
+      return catalogCache.endpoints ?? availableEndpoints()
     },
     async catalog(connection, signal) {
       if (catalogCache.items.length && Date.now() - catalogCache.at < 10 * 60_000) {
@@ -952,6 +1066,9 @@ function magpieToolRuntime() {
 function openCodeToolRuntime(ctx) {
   return {
     connection: () => openCodeCredential(ctx),
+    endpoints(connection) {
+      return availableEndpoints(connection.baseURL, connection.systemOneBase)
+    },
     catalog(connection, signal) {
       return readModels(connection.baseURL, connection.key, signal)
     },
@@ -959,7 +1076,10 @@ function openCodeToolRuntime(ctx) {
       return withoutProvider(id)
     },
     request(connection, path, options) {
-      return apiRequest(connection.baseURL, connection.key, path, options)
+      const base = path === "/systemone" && connection.systemOneBase
+        ? connection.systemOneBase
+        : connection.baseURL
+      return apiRequest(base, connection.key, path, options)
     },
   }
 }
@@ -998,6 +1118,19 @@ function markSignIn(res) {
   })
 }
 
+function systemOneTarget(input, base) {
+  let url
+  try {
+    url = new URL(input instanceof Request ? input.url : String(input))
+  } catch {
+    return undefined
+  }
+  if (!/\/systemone\/?$/i.test(url.pathname)) return undefined
+  const target = new URL(`${normalizeSystemOne(base)}/systemone`)
+  target.search = url.search
+  return target.toString()
+}
+
 function openCodeGatewayField() {
   return {
     type: "string",
@@ -1012,20 +1145,38 @@ function openCodeGatewayField() {
   }
 }
 
+function openCodeSystemOneField() {
+  return {
+    type: "string",
+    key: "systemOneURL",
+    title: "System One URL",
+    description: "Optional; leave empty to use the gateway's /v1 base.",
+    placeholder: DEFAULT_BASE,
+    format: "uri",
+  }
+}
+
 function credentialAuth(credential) {
   if (credential?.type === "oauth") {
+    const baseURL = normalizeBase(credential.metadata?.baseURL)
     return {
       key: text(credential.access),
-      baseURL: normalizeBase(credential.metadata?.baseURL),
+      baseURL,
+      systemOneBase: normalizeSystemOne(credential.metadata?.systemOneURL, baseURL),
     }
   }
   if (credential?.type === "key") {
+    // `gateway` is the current OpenCode field. `baseURL` keeps credentials
+    // created by earlier versions working.
+    const baseURL = normalizeBase(
+      credential.configuration?.gateway ?? credential.configuration?.baseURL,
+    )
     return {
       key: text(credential.key),
-      // `gateway` is the current OpenCode field. `baseURL` keeps credentials
-      // created by earlier versions working.
-      baseURL: normalizeBase(
-        credential.configuration?.gateway ?? credential.configuration?.baseURL,
+      baseURL,
+      systemOneBase: normalizeSystemOne(
+        credential.configuration?.systemOneURL,
+        baseURL,
       ),
     }
   }
@@ -1111,12 +1262,14 @@ function openCodeOAuth() {
       id: "oauth",
       type: "oauth",
       label: "Sign in with OpenCSG",
-      form: [openCodeGatewayField()],
+      form: [openCodeGatewayField(), openCodeSystemOneField()],
     },
     async authorize(inputs) {
       let gateway
+      let systemOne
       try {
         gateway = normalizeBase(inputs?.gateway ?? inputs?.baseURL)
+        systemOne = normalizeSystemOne(inputs?.systemOneURL, gateway)
       } catch (e) {
         throw new Error(e.message)
       }
@@ -1150,6 +1303,8 @@ function openCodeOAuth() {
             expires: 0,
             metadata: {
               baseURL: gateway,
+              systemOneURL:
+                systemOne === protocolEndpoints(gateway).decide ? "" : systemOne,
               username: claims.username,
               uuid: claims.uuid,
             },
@@ -1179,6 +1334,7 @@ async function readOpenCodeCatalog(ctx, models) {
       )
     : undefined
   const baseURL = auth?.baseURL ?? DEFAULT_BASE
+  const endpoints = availableEndpoints(baseURL, auth?.systemOneBase)
   const retained =
     models instanceof Map && models.size
       ? withOpenCodeBaseURL(models, baseURL)
@@ -1188,6 +1344,7 @@ async function readOpenCodeCatalog(ctx, models) {
     const live = openCodeModels(items, models, baseURL)
     return {
       baseURL,
+      endpoints,
       models: live.size ? live : retained,
       sourceConnection: connection,
     }
@@ -1195,7 +1352,7 @@ async function readOpenCodeCatalog(ctx, models) {
     // A failed refresh cannot prove that the retained catalog belongs to the
     // active connection. Keep the provider visible, but do not bind stale
     // models to a new credential.
-    return { baseURL, models: retained }
+    return { baseURL, endpoints, models: retained }
   }
 }
 
@@ -1213,7 +1370,7 @@ async function openCodeSetup(ctx) {
       method: {
         type: "key",
         label: "OpenCSG API key",
-        form: [openCodeGatewayField()],
+        form: [openCodeGatewayField(), openCodeSystemOneField()],
       },
     })
     editor.method.update(openCodeOAuth())
@@ -1281,8 +1438,9 @@ export const OpenCSGAuthPlugin = async ({ client } = {}) => {
         api: DEFAULT_BASE,
         models: FALLBACK_MODELS,
       }
-      cfg.provider[PROVIDER].decide = true
-      cfg.provider[PROVIDER].models ??= FALLBACK_MODELS
+      const provider = cfg.provider[PROVIDER]
+      configureProviderEndpoints(provider)
+      provider.models ??= FALLBACK_MODELS
     },
 
     auth: {
@@ -1292,11 +1450,13 @@ export const OpenCSGAuthPlugin = async ({ client } = {}) => {
         {
           type: "oauth",
           label: "Sign in with OpenCSG",
-          prompts: [BASE_URL_PROMPT],
+          prompts: AUTH_PROMPTS,
           async authorize(inputs) {
             let gateway
+            let systemOne
             try {
               gateway = normalizeBase(inputs?.baseURL)
+              systemOne = normalizeSystemOne(inputs?.systemOneURL, gateway)
             } catch (e) {
               return { type: "failed", error: e.message }
             }
@@ -1332,6 +1492,8 @@ export const OpenCSGAuthPlugin = async ({ client } = {}) => {
                     key,
                     metadata: {
                       baseURL: gateway === DEFAULT_BASE ? "" : gateway,
+                      systemOneURL:
+                        systemOne === protocolEndpoints(gateway).decide ? "" : systemOne,
                       username: claims.username,
                       uuid: claims.uuid,
                     },
@@ -1354,6 +1516,10 @@ export const OpenCSGAuthPlugin = async ({ client } = {}) => {
         const auth = await getAuth()
         if (!signedIn(auth)) return {}
         const base = gatewayOf(auth)
+        const systemOneBase = normalizeSystemOne(
+          auth.metadata?.systemOneURL || endpointSettings.systemOneURL,
+          base,
+        )
         return {
           baseURL: base,
           apiKey: auth.key,
@@ -1363,7 +1529,13 @@ export const OpenCSGAuthPlugin = async ({ client } = {}) => {
             headers.set("Authorization", `Bearer ${auth.key}`)
             headers.set("Accept", headers.get("Accept") ?? "application/json")
             headers.delete("content-length")
-            const res = await fetch(input, {
+            const target = systemOneTarget(input, systemOneBase)
+            const request = target
+              ? input instanceof Request
+                ? new Request(target, input)
+                : target
+              : input
+            const res = await fetch(request, {
               ...init,
               headers,
               signal: init?.signal ?? (input instanceof Request ? input.signal : undefined),
@@ -1385,6 +1557,10 @@ export const OpenCSGAuthPlugin = async ({ client } = {}) => {
         try {
           const items = await readModels(base, key, signal)
           catalogCache.base = base
+          catalogCache.endpoints = availableEndpoints(
+            base,
+            auth?.metadata?.systemOneURL || endpointSettings.systemOneURL,
+          )
           catalogCache.items = items
           catalogCache.at = Date.now()
           const live = liveModels(items, provider)
@@ -1406,6 +1582,7 @@ export const OpenCSGAuthPlugin = async ({ client } = {}) => {
 export const _internal = {
   PROVIDER,
   DEFAULT_BASE,
+  ALTERNATE_PROTOCOLS,
   FALLBACK_MODELS,
   DEFAULT_MAGPIE_GATEWAY,
   OpenCodePlugin,
@@ -1414,6 +1591,7 @@ export const _internal = {
   chooseModel,
   createToolDefinitions,
   credentialAuth,
+  endpointSettings,
   modelKind,
   modelKinds,
   openCodeModel,
@@ -1439,9 +1617,13 @@ export const _internal = {
   pricingOf,
   tasksOf,
   modelOf,
+  availableEndpoints,
+  normalizeSystemOne,
+  protocolEndpoints,
   liveModels,
   markSignIn,
   systemOneBody,
+  systemOneTarget,
   videoResult,
   withoutProvider,
 }

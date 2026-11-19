@@ -9,7 +9,9 @@ afterEach(() => {
   globalThis.fetch = realFetch
   _internal.catalogCache.items = []
   _internal.catalogCache.base = ""
+  _internal.catalogCache.endpoints = undefined
   _internal.catalogCache.at = 0
+  _internal.endpointSettings.systemOneURL = ""
 })
 
 const modelPage = (data, extra = {}) => ({
@@ -247,6 +249,10 @@ describe("model metadata", () => {
       id: "chat",
       npm: "@ai-sdk/openai-compatible",
     })
+    expect(models.chat.also).toEqual(_internal.ALTERNATE_PROTOCOLS)
+    expect(models.image.also).toBeUndefined()
+    expect(models.video.also).toBeUndefined()
+    expect(models.decision.also).toBeUndefined()
     expect(models.image).toMatchObject({
       kind: "image",
       tool_call: false,
@@ -374,6 +380,12 @@ describe("media and System One tools", () => {
         available: true,
       },
     ])
+    expect(result.endpoints).toEqual({
+      chat: "https://gateway.example/v1",
+      anthropic: "https://gateway.example",
+      responses: "https://gateway.example/v1",
+      decide: "https://gateway.example/v1",
+    })
     expect(result.groups.video).toEqual(["video-a"])
   })
 
@@ -567,7 +579,12 @@ describe("plugin hooks", () => {
       name: "OpenCSG",
       npm: "@ai-sdk/openai-compatible",
       api: "https://opencsg.com/aigateway/v1",
+      chat: "https://opencsg.com/aigateway/v1",
+      anthropic: "https://opencsg.com/aigateway",
+      responses: "https://opencsg.com/aigateway/v1",
       decide: true,
+      decideURL: "https://opencsg.com/aigateway/v1",
+      baseAPI: "chat",
     })
     expect(Object.keys(cfg.provider.opencsg.models)).toEqual(["auto"])
     expect(Object.keys(hooks.tool)).toEqual([
@@ -581,6 +598,54 @@ describe("plugin hooks", () => {
       expect(tool.args.type).toBe("object")
       expect(typeof tool.execute).toBe("function")
     }
+  })
+
+  test("keeps custom protocol endpoints and migrates the old decide flag", async () => {
+    const hooks = await load(undefined)
+    const cfg = {
+      provider: {
+        opencsg: {
+          chat: "https://private.example/aigateway/v1",
+          anthropic: "https://anthropic.example",
+          responses: "",
+          decide: true,
+          baseAPI: "anthropic",
+        },
+      },
+    }
+
+    await hooks.config(cfg)
+
+    expect(cfg.provider.opencsg).toMatchObject({
+      api: "https://private.example/aigateway/v1",
+      chat: "https://private.example/aigateway/v1",
+      anthropic: "https://anthropic.example",
+      responses: "",
+      decide: true,
+      decideURL: "https://private.example/aigateway/v1",
+      baseAPI: "anthropic",
+    })
+    expect(_internal.endpointSettings.systemOneURL).toBe(
+      "https://private.example/aigateway/v1",
+    )
+  })
+
+  test("derives protocol endpoints from custom gateway forms", () => {
+    expect(_internal.protocolEndpoints("https://opencsg-stg.com/aigateway")).toEqual({
+      chat: "https://opencsg-stg.com/aigateway/v1",
+      anthropic: "https://opencsg-stg.com/aigateway",
+      responses: "https://opencsg-stg.com/aigateway/v1",
+      decide: "https://opencsg-stg.com/aigateway/v1",
+    })
+  })
+
+  test("normalizes a System One base or full endpoint", () => {
+    expect(
+      _internal.normalizeSystemOne("https://system.example/aigateway/systemone"),
+    ).toBe("https://system.example/aigateway/v1")
+    expect(_internal.normalizeSystemOne("https://system.example/v1", _internal.DEFAULT_BASE)).toBe(
+      "https://system.example/v1",
+    )
   })
 
   test("models reads the public catalog without an account", async () => {
@@ -612,7 +677,10 @@ describe("plugin hooks", () => {
       placeholder: "gw-sk-…",
     })
     expect(methods[0].authorize).toBeUndefined()
-    expect(methods[0].prompts.map((prompt) => prompt.key)).toEqual(["baseURL"])
+    expect(methods[0].prompts.map((prompt) => prompt.key)).toEqual([
+      "baseURL",
+      "systemOneURL",
+    ])
     expect(methods[1].prompts[0].key).toBe("baseURL")
 
     const localFetch = globalThis.fetch
@@ -670,14 +738,17 @@ describe("plugin hooks", () => {
     const auth = {
       type: "api",
       key: "gw-sk-test",
-      metadata: { baseURL: "https://private.example/v1" },
+      metadata: {
+        baseURL: "https://private.example/v1",
+        systemOneURL: "https://system.example",
+      },
     }
     const hooks = await load(auth)
     const loader = await hooks.auth.loader(async () => auth)
     const signal = new AbortController().signal
-    let request
+    const requests = []
     globalThis.fetch = async (input, init) => {
-      request = { input, init }
+      requests.push({ input, init })
       return new Response("nope", { status: 401 })
     }
 
@@ -692,13 +763,20 @@ describe("plugin hooks", () => {
       signal,
     })
 
-    expect(request.input).toBe("https://private.example/v1/chat/completions")
-    expect(request.init.headers.get("authorization")).toBe("Bearer gw-sk-test")
-    expect(request.init.headers.get("x-opencsg-client")).toBe("opencsg-magpie/0.1.3")
-    expect(request.init.headers.get("content-length")).toBeNull()
-    expect(request.init.signal).toBe(signal)
+    expect(requests[0].input).toBe("https://private.example/v1/chat/completions")
+    expect(requests[0].init.headers.get("authorization")).toBe("Bearer gw-sk-test")
+    expect(requests[0].init.headers.get("x-opencsg-client")).toBe("opencsg-magpie/0.1.4")
+    expect(requests[0].init.headers.get("content-length")).toBeNull()
+    expect(requests[0].init.signal).toBe(signal)
     expect(res.headers.get("x-magpie-sign-in")).toBe("expired")
     expect(loader.baseURL).toBe("https://private.example/v1")
+
+    await loader.fetch("https://private.example/v1/systemone", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+    })
+    expect(requests[1].input).toBe("https://system.example/v1/systemone")
   })
 
   test("loader stays empty when no account is signed in", async () => {
@@ -805,12 +883,18 @@ describe("OpenCode v2 plugin", () => {
     expect(state.methods.map((method) => method.type)).toEqual(["key", "oauth"])
     expect(state.methods[0]).toMatchObject({
       label: "OpenCSG API key",
-      form: [{ key: "gateway", type: "string" }],
+      form: [
+        { key: "gateway", type: "string" },
+        { key: "systemOneURL", type: "string" },
+      ],
     })
     expect(state.methods[1]).toMatchObject({
       id: "oauth",
       label: "Sign in with OpenCSG",
-      form: [{ key: "gateway", type: "string" }],
+      form: [
+        { key: "gateway", type: "string" },
+        { key: "systemOneURL", type: "string" },
+      ],
     })
 
     const provider = state.providers.get("opencsg")
@@ -979,6 +1063,7 @@ describe("OpenCode v2 plugin", () => {
     ).toEqual({
       key: "gw-sk-oauth",
       baseURL: "https://opencsg.example/aigateway/v1",
+      systemOneBase: "https://opencsg.example/aigateway/v1",
     })
   })
 
@@ -992,6 +1077,7 @@ describe("OpenCode v2 plugin", () => {
     ).toEqual({
       key: "gw-sk-legacy",
       baseURL: "https://legacy.example/aigateway/v1",
+      systemOneBase: "https://legacy.example/aigateway/v1",
     })
   })
 
