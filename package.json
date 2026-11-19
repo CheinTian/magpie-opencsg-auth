@@ -1,6 +1,6 @@
 {
   "name": "magpie-opencsg-auth",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "OpenCode and magpie provider plugin for OpenCSG AI Gateway with chat, Anthropic, Responses, media, System One, API key and OAuth support",
   "type": "module",
   "main": "./magpie.mjs",

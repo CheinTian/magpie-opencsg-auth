@@ -21,7 +21,7 @@ const NPM = "@ai-sdk/openai-compatible"
 const ALTERNATE_PROTOCOLS = ["@ai-sdk/anthropic", "@ai-sdk/openai"]
 const OPENCODE_NPM = "@opencode/ai/providers/openai-compatible"
 const PLUGIN_ID = "magpie-opencsg-auth"
-const CLIENT_HEADER = "opencsg-magpie/0.1.4"
+const CLIENT_HEADER = "opencsg-magpie/0.1.5"
 const TIMEOUT_MS = 20_000
 const TOOL_TIMEOUT_MS = 45_000
 const OAUTH_TIMEOUT_MS = 10 * 60_000
@@ -155,6 +155,7 @@ function configureProviderEndpoints(provider) {
   // Keep the endpoint beside it so it stays visible and editable rather than
   // replacing the flag with a string the host would read as disabled.
   const configuredSystemOne = text(provider.decide)
+  const explicitSystemOne = text(provider.decideURL) || configuredSystemOne
   if (provider.decide === undefined || provider.decide === true || configuredSystemOne) {
     const candidate = text(provider.decideURL) || configuredSystemOne || endpoints.decide
     provider.decide = true
@@ -163,7 +164,10 @@ function configureProviderEndpoints(provider) {
     } catch {
       provider.decideURL = endpoints.decide
     }
-    endpointSettings.systemOneURL = provider.decideURL
+    // A generated decideURL is only a visible default. Keep overriding it only
+    // when the user explicitly configured one; otherwise a custom account
+    // gateway must also supply the System One endpoint.
+    endpointSettings.systemOneURL = explicitSystemOne ? provider.decideURL : ""
   } else {
     endpointSettings.systemOneURL = ""
   }

@@ -625,9 +625,25 @@ describe("plugin hooks", () => {
       decideURL: "https://private.example/aigateway/v1",
       baseAPI: "anthropic",
     })
-    expect(_internal.endpointSettings.systemOneURL).toBe(
-      "https://private.example/aigateway/v1",
-    )
+    expect(_internal.endpointSettings.systemOneURL).toBe("")
+  })
+
+  test("keeps an explicitly configured System One endpoint", async () => {
+    const hooks = await load(undefined)
+    const cfg = {
+      provider: {
+        opencsg: {
+          chat: "https://private.example/aigateway/v1",
+          decide: true,
+          decideURL: "https://system.example",
+        },
+      },
+    }
+
+    await hooks.config(cfg)
+
+    expect(cfg.provider.opencsg.decideURL).toBe("https://system.example/v1")
+    expect(_internal.endpointSettings.systemOneURL).toBe("https://system.example/v1")
   })
 
   test("derives protocol endpoints from custom gateway forms", () => {
@@ -765,7 +781,7 @@ describe("plugin hooks", () => {
 
     expect(requests[0].input).toBe("https://private.example/v1/chat/completions")
     expect(requests[0].init.headers.get("authorization")).toBe("Bearer gw-sk-test")
-    expect(requests[0].init.headers.get("x-opencsg-client")).toBe("opencsg-magpie/0.1.4")
+    expect(requests[0].init.headers.get("x-opencsg-client")).toBe("opencsg-magpie/0.1.5")
     expect(requests[0].init.headers.get("content-length")).toBeNull()
     expect(requests[0].init.signal).toBe(signal)
     expect(res.headers.get("x-magpie-sign-in")).toBe("expired")
@@ -777,6 +793,29 @@ describe("plugin hooks", () => {
       body: "{}",
     })
     expect(requests[1].input).toBe("https://system.example/v1/systemone")
+  })
+
+  test("derives System One from a custom account gateway when it is not configured", async () => {
+    const auth = {
+      type: "api",
+      key: "gw-sk-test",
+      metadata: { baseURL: "https://private.example/aigateway/v1" },
+    }
+    const hooks = await load(auth)
+    const loader = await hooks.auth.loader(async () => auth)
+    const requests = []
+    globalThis.fetch = async (input, init) => {
+      requests.push({ input, init })
+      return new Response("ok")
+    }
+
+    await loader.fetch("https://private.example/aigateway/v1/systemone", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+    })
+
+    expect(requests[0].input).toBe("https://private.example/aigateway/v1/systemone")
   })
 
   test("loader stays empty when no account is signed in", async () => {
