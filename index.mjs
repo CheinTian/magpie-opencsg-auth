@@ -30,7 +30,7 @@ const NPM = "@ai-sdk/openai-compatible"
 const ALTERNATE_PROTOCOLS = ["@ai-sdk/anthropic", "@ai-sdk/openai"]
 const OPENCODE_NPM = "@opencode/ai/providers/openai-compatible"
 const PLUGIN_ID = "magpie-opencsg-auth"
-const CLIENT_HEADER = "opencsg-magpie/0.1.7"
+const CLIENT_HEADER = "opencsg-magpie/0.2.0"
 const TIMEOUT_MS = 20_000
 const TOOL_TIMEOUT_MS = 45_000
 const OAUTH_TIMEOUT_MS = 10 * 60_000
@@ -601,6 +601,174 @@ async function readModels(base, key, signal) {
     cursor = next
   }
   return out
+}
+
+// ---- account usage ----------------------------------------------------------
+// magpie asks an account's allowance through auth.usage, its own hook; OpenCode
+// has none and ignores it. CSGHub answers from the accounting service, which a
+// private deployment may not run, and which says nothing about a person without
+// a subscription. Every read here must therefore answer "nothing to show"
+// rather than fail the account.
+
+const USAGE_TTL_MS = 60_000
+// magpie gives a usage read 20 seconds; the identity read and the two account
+// reads that follow it must fit inside that.
+const USAGE_TIMEOUT_MS = 8_000
+const usageCache = new Map()
+
+// CSGHub keeps money in 分 (cents); csghub-portal renders a balance as
+// `Number(balance) / 100`. Everything that leaves this file is 元.
+function moneyOfCents(cents) {
+  const value = finite(cents)
+  if (value === undefined) return ""
+  const fixed = (value / 100).toFixed(2)
+  const negative = fixed.startsWith("-") && Number(fixed) !== 0
+  const [whole, fraction] = fixed.replace("-", "").split(".")
+  return `${negative ? "-" : ""}¥${whole.replace(/\B(?=(\d{3})+(?!\d))/g, ",")}.${fraction}`
+}
+
+// CSGHub timestamps are unix seconds; magpie takes ISO 8601 or milliseconds.
+function isoTimestamp(value) {
+  const seconds = finite(value)
+  if (!seconds || seconds <= 0) return undefined
+  const date = new Date(seconds < 1e11 ? seconds * 1000 : seconds)
+  return Number.isNaN(date.getTime()) ? undefined : date.toISOString()
+}
+
+// A plan quota counts tokens for these tasks and requests for every other one
+// (the server's IsTokenMetred, as csghub-portal's quotaUnit mirrors it).
+const TOKEN_TASKS = new Set(["text-generation", "text-ranking", "feature-extraction"])
+
+function quotaUnitOf(taskType) {
+  const task = text(taskType)
+  if (!task || task.includes(",")) return ""
+  return TOKEN_TASKS.has(task) ? "tokens" : "requests"
+}
+
+// portalGet reads one JSON answer from the portal that serves the gateway. It
+// answers undefined for a route this deployment does not offer: community
+// CSGHub runs no accounting service, and a namespace without a token plan has
+// no plan, so an allowance quietly has nothing to show either way.
+async function portalGet(portal, key, path, signal) {
+  const res = await fetch(`${portal}${path}`, {
+    headers: {
+      Accept: "application/json",
+      "X-OpenCSG-Client": CLIENT_HEADER,
+      Authorization: `Bearer ${key}`,
+    },
+    signal: requestSignal(signal, USAGE_TIMEOUT_MS),
+  })
+  const raw = await res.text().catch(() => "")
+  if (res.status === 401 || res.status === 403 || res.status === 404) return undefined
+  if (!res.ok) throw new Error(responseErrorFromBody(res, raw))
+  const body = safeJSON(raw)
+  return isObject(body) ? body : undefined
+}
+
+// accountIdentity names the account behind a key and its namespace, which is
+// where its token plan lives. A personal namespace shares the user's UUID, so
+// the sign-in's own UUID is the fallback when the key's record is unreadable.
+async function accountIdentity(portal, key, auth, signal) {
+  const found = { uuid: text(auth?.metadata?.uuid), username: text(auth?.metadata?.username), namespace: "" }
+  const body = await portalGet(portal, key, `/api/v1/token/${encodeURIComponent(key)}`, signal)
+  const info = isObject(body?.data) ? body.data : undefined
+  if (info) {
+    found.uuid = text(info.user_uuid) || found.uuid
+    found.username = text(info.user_name) || found.username
+    found.namespace = text(info.ns_uuid)
+  }
+  found.namespace ||= found.uuid
+  return found
+}
+
+// currentPlan picks the plan in force from the current-subscription answer.
+// Older servers return one instance, newer ones a list; no plan at all is an
+// answer without data.
+function currentPlan(body) {
+  const data = body?.data
+  const list = Array.isArray(data) ? data : isObject(data) ? [data] : []
+  return list.find((item) => text(item?.status) === "active") ?? list[0]
+}
+
+// planOf turns a token plan into magpie's allowance: the plan's name, when the
+// period it meters ends, and one window per model quota in that period. Each
+// window counts only its own model, so a model at its cap leaves the account
+// free for the others.
+function planOf(instance) {
+  if (!isObject(instance)) return { plan: "", until: undefined, renew: "", windows: [] }
+  const version = isObject(instance.latest_plan_version) ? instance.latest_plan_version : {}
+  const period = isObject(instance.latest_period) ? instance.latest_period : {}
+  const resetsAt = isoTimestamp(period.end_at)
+  const windows = []
+  for (const usage of Array.isArray(period.models_usage) ? period.models_usage : []) {
+    const model = text(usage?.model_id)
+    if (!model) continue
+    const unit = quotaUnitOf(usage?.task_type)
+    if (!unit) continue
+    const tokens = unit === "tokens"
+    const limit = finite(tokens ? usage.quota_tokens : usage.quota_request_count) ?? 0
+    const amount = finite(tokens ? usage.used_tokens : usage.used_request_count) ?? 0
+    if (limit <= 0 && amount <= 0) continue
+    windows.push({ name: model, models: [model], amount, limit, unit, ...(resetsAt ? { resetsAt } : {}) })
+  }
+  const status = text(instance.status)
+  const endAt = finite(instance.end_at) ?? 0
+  return {
+    plan: text(version.plan_name),
+    until: isoTimestamp(period.end_at) ?? isoTimestamp(endAt),
+    // An active subscription with no end renews itself; a canceled one keeps
+    // running to its end and then stops.
+    renew: status === "canceled" || status === "closed" ? "off" : status === "active" && endAt === 0 ? "auto" : "",
+    windows,
+  }
+}
+
+async function accountUsage(getAuth, signal) {
+  const auth = await getAuth()
+  if (!signedIn(auth)) return {}
+  const portal = portalOf(gatewayOf(auth))
+  const key = auth.key
+  const cacheKey = `${portal}\n${key}`
+  const cached = usageCache.get(cacheKey)
+  if (cached && Date.now() - cached.at < USAGE_TTL_MS) return cached.value
+
+  const account = await accountIdentity(portal, key, auth, signal)
+  const [balanceBody, planBody] = await Promise.all([
+    account.uuid
+      ? portalGet(portal, key, `/api/v1/accounting/credit/${encodeURIComponent(account.uuid)}/balance`, signal)
+      : undefined,
+    account.namespace
+      ? portalGet(portal, key, `/api/v1/accounting/token-plans/${encodeURIComponent(account.namespace)}/get`, signal)
+      : undefined,
+  ])
+
+  const usage = {}
+  const user = account.username || account.uuid
+  if (user) usage.user = user
+
+  const windows = []
+  const plan = planOf(currentPlan(planBody))
+  if (plan.plan) usage.plan = plan.plan
+  if (plan.until) usage.until = plan.until
+  if (plan.renew) usage.renew = plan.renew
+  windows.push(...plan.windows)
+
+  const balance = isObject(balanceBody?.data) ? balanceBody.data : undefined
+  const money = moneyOfCents(balance?.balance)
+  if (money) usage.balance = money
+  const composition = isObject(balance?.composition) ? balance.composition : undefined
+  if (composition) {
+    const cash = finite(composition.cash)
+    const bonus = finite(composition.bonus)
+    const parts = []
+    if (cash) parts.push(`Cash ${moneyOfCents(cash)}`)
+    if (bonus) parts.push(`Bonus ${moneyOfCents(bonus)}`)
+    if (parts.length) windows.push({ name: "Credit", display: parts.join(" · "), aside: true })
+  }
+  if (windows.length) usage.windows = windows
+
+  usageCache.set(cacheKey, { at: Date.now(), value: usage })
+  return usage
 }
 
 function tasksOf(model) {
@@ -1605,6 +1773,16 @@ export const OpenCSGAuthPlugin = async ({ client } = {}) => {
         },
       ],
 
+      // magpie's own hook (OpenCode never calls it): the account's plan and
+      // balance, or nothing when this deployment does not keep accounting.
+      async usage(getAuth) {
+        try {
+          return await accountUsage(getAuth)
+        } catch (e) {
+          return { error: `could not read the OpenCSG allowance: ${e.message}` }
+        }
+      },
+
       async loader(getAuth) {
         const auth = await getAuth()
         if (!signedIn(auth)) return {}
@@ -1734,6 +1912,14 @@ export const _internal = {
   callbackServer,
   keyForJWT,
   readModels,
+  accountUsage,
+  accountIdentity,
+  currentPlan,
+  isoTimestamp,
+  moneyOfCents,
+  planOf,
+  quotaUnitOf,
+  usageCache,
   pricingOf,
   tasksOf,
   modelOf,

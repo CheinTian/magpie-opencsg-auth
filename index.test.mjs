@@ -12,6 +12,7 @@ afterEach(() => {
   _internal.catalogCache.endpoints = undefined
   _internal.catalogCache.at = 0
   _internal.endpointSettings.systemOneURL = ""
+  _internal.usageCache.clear()
 })
 
 const modelPage = (data, extra = {}) => ({
@@ -235,6 +236,180 @@ describe("readModels", () => {
     await expect(_internal.readModels("https://gateway.example/v1", "bad")).rejects.toThrow(
       "OpenCSG answered 401: invalid key",
     )
+  })
+})
+
+describe("account usage", () => {
+  const gateway = "https://gateway.example/aigateway/v1"
+  const portal = "https://gateway.example"
+  const auth = (metadata = {}) => async () => ({ type: "api", key: "gk-test", metadata })
+
+  const account = {
+    user_uuid: "user-1",
+    user_name: "alice",
+    ns_uuid: "user-1",
+  }
+  const balance = (cents, bonus = 0, cash = cents) => ({
+    msg: "OK",
+    data: { balance: cents, composition: { bonus, cash }, low_balance_warn: 10000 },
+  })
+
+  test("renders 分 as 元, as the portal does", () => {
+    expect(_internal.moneyOfCents(550984.7062496282)).toBe("¥5,509.85")
+    expect(_internal.moneyOfCents(-41141.09013933388)).toBe("-¥411.41")
+    expect(_internal.moneyOfCents(0)).toBe("¥0.00")
+    expect(_internal.moneyOfCents(123456789)).toBe("¥1,234,567.89")
+    expect(_internal.moneyOfCents(undefined)).toBe("")
+  })
+
+  test("counts plan quotas in the unit the task is metered in", () => {
+    expect(_internal.quotaUnitOf("text-generation")).toBe("tokens")
+    expect(_internal.quotaUnitOf("text-ranking")).toBe("tokens")
+    expect(_internal.quotaUnitOf("text-to-image")).toBe("requests")
+    expect(_internal.quotaUnitOf("")).toBe("")
+    expect(_internal.quotaUnitOf("text-generation,text-to-image")).toBe("")
+  })
+
+  test("maps a token plan to per-model windows that renew with the period", () => {
+    const plan = _internal.planOf({
+      status: "active",
+      end_at: 0,
+      latest_plan_version: { plan_name: "Pro", billing_period: 1, period_unit: "month" },
+      latest_period: {
+        start_at: 1_767_225_600,
+        end_at: 1_769_904_000,
+        models_usage: [
+          { model_id: "Qwen/Qwen3-32B", task_type: "text-generation", quota_tokens: 2_000_000, used_tokens: 500_000 },
+          { model_id: "black-forest-labs/FLUX.1", task_type: "text-to-image", quota_request_count: 100, used_request_count: 25 },
+          { model_id: "skip/empty", task_type: "text-generation", quota_tokens: 0, used_tokens: 0 },
+        ],
+      },
+    })
+
+    expect(plan.plan).toBe("Pro")
+    expect(plan.renew).toBe("auto")
+    expect(plan.until).toBe("2026-02-01T00:00:00.000Z")
+    expect(plan.windows).toEqual([
+      {
+        name: "Qwen/Qwen3-32B",
+        models: ["Qwen/Qwen3-32B"],
+        amount: 500_000,
+        limit: 2_000_000,
+        unit: "tokens",
+        resetsAt: "2026-02-01T00:00:00.000Z",
+      },
+      {
+        name: "black-forest-labs/FLUX.1",
+        models: ["black-forest-labs/FLUX.1"],
+        amount: 25,
+        limit: 100,
+        unit: "requests",
+        resetsAt: "2026-02-01T00:00:00.000Z",
+      },
+    ])
+  })
+
+  test("reads the balance and plan behind a Gateway key", async () => {
+    const calls = []
+    globalThis.fetch = async (input, init) => {
+      const url = new URL(input)
+      calls.push({ path: url.pathname, headers: new Headers(init.headers) })
+      if (url.pathname === "/api/v1/token/gk-test") return Response.json({ msg: "OK", data: account })
+      if (url.pathname === "/api/v1/accounting/credit/user-1/balance")
+        return Response.json(balance(550984.7062496282, 592125.7963889621, -41141.09013933388))
+      if (url.pathname === "/api/v1/accounting/token-plans/user-1/get")
+        return Response.json({
+          msg: "OK",
+          data: {
+            status: "active",
+            end_at: 0,
+            latest_plan_version: { plan_name: "Pro" },
+            latest_period: {
+              end_at: 1_769_904_000,
+              models_usage: [
+                { model_id: "Qwen/Qwen3-32B", task_type: "text-generation", quota_tokens: 1000, used_tokens: 250 },
+              ],
+            },
+          },
+        })
+      return new Response("not found", { status: 404 })
+    }
+
+    const usage = await _internal.accountUsage(auth({ baseURL: gateway }))
+
+    expect(usage.user).toBe("alice")
+    expect(usage.balance).toBe("¥5,509.85")
+    expect(usage.plan).toBe("Pro")
+    expect(usage.renew).toBe("auto")
+    expect(usage.windows).toEqual([
+      {
+        name: "Qwen/Qwen3-32B",
+        models: ["Qwen/Qwen3-32B"],
+        amount: 250,
+        limit: 1000,
+        unit: "tokens",
+        resetsAt: "2026-02-01T00:00:00.000Z",
+      },
+      { name: "Credit", display: "Cash -¥411.41 · Bonus ¥5,921.26", aside: true },
+    ])
+    expect(calls.map((call) => call.path)).toEqual([
+      "/api/v1/token/gk-test",
+      "/api/v1/accounting/credit/user-1/balance",
+      "/api/v1/accounting/token-plans/user-1/get",
+    ])
+    for (const call of calls) expect(call.headers.get("authorization")).toBe("Bearer gk-test")
+  })
+
+  test("keeps a private deployment without accounting from failing", async () => {
+    globalThis.fetch = async (input) => {
+      const url = new URL(input)
+      if (url.pathname === "/api/v1/token/gk-test") return Response.json({ msg: "OK", data: account })
+      return new Response("not found", { status: 404 })
+    }
+
+    expect(await _internal.accountUsage(auth({ baseURL: gateway }))).toEqual({ user: "alice" })
+  })
+
+  test("answers no plan without a namespace and no balance without a user", async () => {
+    globalThis.fetch = async () => new Response("not found", { status: 404 })
+
+    expect(await _internal.accountUsage(auth({ baseURL: gateway }))).toEqual({})
+  })
+
+  test("reports a real accounting failure instead of hiding it", async () => {
+    globalThis.fetch = async (input) => {
+      const url = new URL(input)
+      if (url.pathname === "/api/v1/token/gk-test") return Response.json({ msg: "OK", data: account })
+      return Response.json({ msg: "accounting is down" }, { status: 500 })
+    }
+
+    await expect(_internal.accountUsage(auth({ baseURL: gateway }))).rejects.toThrow(
+      "OpenCSG answered 500: accounting is down",
+    )
+  })
+
+  test("caches a read for a minute", async () => {
+    let calls = 0
+    globalThis.fetch = async (input) => {
+      calls++
+      const url = new URL(input)
+      if (url.pathname === "/api/v1/token/gk-test") return Response.json({ msg: "OK", data: account })
+      if (url.pathname.endsWith("/balance")) return Response.json(balance(100))
+      return new Response("not found", { status: 404 })
+    }
+
+    const first = await _internal.accountUsage(auth({ baseURL: gateway }))
+    const second = await _internal.accountUsage(auth({ baseURL: gateway }))
+
+    expect(calls).toBe(3)
+    expect(second).toBe(first)
+  })
+
+  test("is wired into the plugin as magpie's usage hook", async () => {
+    const plugin = await _internal.plugin({})
+    expect(typeof plugin.auth.usage).toBe("function")
+    globalThis.fetch = async () => new Response("not found", { status: 404 })
+    expect(await plugin.auth.usage(async () => ({ type: "api", key: "gk-test", metadata: {} }))).toEqual({})
   })
 })
 
@@ -815,7 +990,7 @@ describe("plugin hooks", () => {
 
     expect(requests[0].input).toBe("https://private.example/v1/chat/completions")
     expect(requests[0].init.headers.get("authorization")).toBe("Bearer gw-sk-test")
-    expect(requests[0].init.headers.get("x-opencsg-client")).toBe("opencsg-magpie/0.1.7")
+    expect(requests[0].init.headers.get("x-opencsg-client")).toBe("opencsg-magpie/0.2.0")
     expect(requests[0].init.headers.get("content-length")).toBeNull()
     expect(requests[0].init.signal).toBe(signal)
     expect(res.headers.get("x-magpie-sign-in")).toBe("expired")
