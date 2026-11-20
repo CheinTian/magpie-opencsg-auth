@@ -89,57 +89,63 @@ describe("OAuth", () => {
     expect(_internal.keyFromPayload({ data: { user_name: "alice" } })).toBe("")
   })
 
-  test("uses the authorize endpoint discovered from /login", async () => {
+  test("asks the user service for the lite sign-in target", async () => {
     let request
     globalThis.fetch = async (input, init) => {
       request = { url: String(input), init }
       return new Response(null, {
         status: 303,
-        headers: { location: "https://iam.opencsg.com/login/oauth/authorize?client_id=client" },
+        headers: { location: "https://iam.opencsg.com/login/oauth/authorize?client_id=client&state=casdoor" },
       })
     }
 
-    const callback = "http://127.0.0.1:4567/callback?nonce=test"
-    const url = await _internal.discoverAuthorizeURL("https://opencsg.com", callback)
+    const url = await _internal.discoverAuthorizeURL("https://opencsg.com")
     const parsed = new URL(url)
 
     expect(request.url).toBe("https://opencsg.com/login")
     expect(request.init.redirect).toBe("manual")
     expect(parsed.origin).toBe("https://iam.opencsg.com")
     expect(parsed.searchParams.get("client_id")).toBe("client")
-    expect(parsed.searchParams.get("state")).toBe(callback)
+    // Anything but the registered routing states lands on the portal's
+    // server-error page (error_code=500); `lite` is the loopback target.
+    expect(parsed.searchParams.get("state")).toBe("lite")
   })
 
   test("falls back to the public IAM app only for opencsg.com", async () => {
     globalThis.fetch = async () => new Response("down", { status: 503 })
-    const callback = "http://127.0.0.1:4567/callback?nonce=test"
 
-    const url = await _internal.authorizeURL("https://opencsg.com", callback)
+    const url = await _internal.authorizeURL("https://opencsg.com")
     const parsed = new URL(url)
     expect(parsed.origin).toBe("https://iam.opencsg.com")
     expect(parsed.searchParams.get("client_id")).toBe("d623c957e69976c8a7a8")
-    expect(parsed.searchParams.get("state")).toBe(callback)
+    expect(parsed.searchParams.get("state")).toBe("lite")
 
-    await expect(_internal.authorizeURL("https://private.example", callback)).rejects.toThrow(
+    await expect(_internal.authorizeURL("https://private.example")).rejects.toThrow(
       "Could not start OpenCSG sign-in",
     )
   })
 
-  test("accepts exactly one nonce-bound callback", async () => {
+  test("listens on the lite callback the platform already trusts", async () => {
     const session = await _internal.callbackServer()
-    const callback = new URL(session.callbackURL)
     const token = jwt({ current_user: "alice", uuid: "user-uuid" })
 
-    const bad = await fetch(`${callback.origin}/callback?nonce=wrong&jwt_token=${token}`)
-    expect(bad.status).toBe(400)
+    expect(session.callbackURL).toBe("http://127.0.0.1:11437/api/cloud/auth/callback")
 
-    const good = await fetch(`${callback.origin}${callback.pathname}${callback.search}&jwt_token=${token}`)
-    expect(good.status).toBe(200)
-    await expect(session.completion).resolves.toEqual({ jwt: token })
+    const other = await fetch("http://127.0.0.1:11437/somewhere-else")
+    expect(other.status).toBe(404)
 
-    const repeated = await fetch(`${callback.origin}${callback.pathname}${callback.search}&jwt_token=${token}`)
-    expect(repeated.status).toBe(200)
+    const missing = await fetch(session.callbackURL)
+    expect(missing.status).toBe(400)
+    await expect(session.completion).resolves.toEqual({
+      error: expect.objectContaining({ message: expect.stringContaining("did not return a sign-in token") }),
+    })
     session.close()
+
+    const second = await _internal.callbackServer()
+    const good = await fetch(`${second.callbackURL}?token=csghub-token&jwt=${token}`)
+    expect(good.status).toBe(200)
+    await expect(second.completion).resolves.toEqual({ jwt: token })
+    second.close()
   })
 
   test("exchanges a JWT for a builtin Gateway key", async () => {
@@ -746,12 +752,11 @@ describe("plugin hooks", () => {
 
     const authorization = await methods[1].authorize({ baseURL: "" })
     expect(authorization.method).toBe("auto")
-    expect(new URL(authorization.url).searchParams.get("state")).toStartWith(
-      "http://127.0.0.1:",
+    expect(new URL(authorization.url).searchParams.get("state")).toBe("lite")
+    expect(authorization.instructions).toContain(
+      "http://127.0.0.1:11437/api/cloud/auth/callback",
     )
-    expect(authorization.url).toContain(encodeURIComponent("http://127.0.0.1:"))
-    const callback = new URL(new URL(authorization.url).searchParams.get("state"))
-    await fetch(callback)
+    await fetch(_internal.DEFAULT_SIGNIN_CALLBACK)
     const failed = await authorization.callback()
     expect(failed.type).toBe("failed")
     expect(failed.error).toContain("did not return a sign-in token")
@@ -810,7 +815,7 @@ describe("plugin hooks", () => {
 
     expect(requests[0].input).toBe("https://private.example/v1/chat/completions")
     expect(requests[0].init.headers.get("authorization")).toBe("Bearer gw-sk-test")
-    expect(requests[0].init.headers.get("x-opencsg-client")).toBe("opencsg-magpie/0.1.6")
+    expect(requests[0].init.headers.get("x-opencsg-client")).toBe("opencsg-magpie/0.1.7")
     expect(requests[0].init.headers.get("content-length")).toBeNull()
     expect(requests[0].init.signal).toBe(signal)
     expect(res.headers.get("x-magpie-sign-in")).toBe("expired")

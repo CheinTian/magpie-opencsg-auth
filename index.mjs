@@ -5,7 +5,6 @@
 // capability metadata come from GET /v1/models. The same plugin also accepts
 // a custom gateway base URL, which is useful for private CSGHub deployments.
 
-import { randomUUID } from "node:crypto"
 import { createServer } from "node:http"
 
 const PROVIDER = "opencsg"
@@ -14,6 +13,16 @@ const DEFAULT_PORTAL = "https://opencsg.com"
 const DEFAULT_IAM_AUTHORIZE = "https://iam.opencsg.com/login/oauth/authorize"
 const DEFAULT_IAM_CLIENT_ID = "d623c957e69976c8a7a8"
 const DEFAULT_IAM_CALLBACK = "https://opencsg.com/api/v1/callback/casdoor"
+// OpenCSG's portal OAuth callback forwards the signed JWT to one of three
+// places: the portal itself (`state=casdoor`), a flow callback registered in
+// OPENCSG_USER_SERVER_FLOW_REDIRECTS (`state=<https URL>`), or the built-in
+// "lite" target (`state=lite` → OPENCSG_USER_SERVER_LITE_REDIRECT_URL).
+// A bare localhost URL in `state` matches none of them, so CSGHub answers
+// with opencsg.com/errors/server-error?error_code=500 - the 500 this plugin
+// used to hit. An app that cannot be registered on the platform must
+// therefore sign in with `state=lite` and receive the fixed loopback callback.
+const SIGNIN_STATE = "lite"
+const DEFAULT_SIGNIN_CALLBACK = "http://127.0.0.1:11437/api/cloud/auth/callback"
 const NPM = "@ai-sdk/openai-compatible"
 // magpie reads these AI SDK package names as the other native protocols a
 // plugin model serves. Advertising them lets magpie offer per-key protocol
@@ -21,7 +30,7 @@ const NPM = "@ai-sdk/openai-compatible"
 const ALTERNATE_PROTOCOLS = ["@ai-sdk/anthropic", "@ai-sdk/openai"]
 const OPENCODE_NPM = "@opencode/ai/providers/openai-compatible"
 const PLUGIN_ID = "magpie-opencsg-auth"
-const CLIENT_HEADER = "opencsg-magpie/0.1.6"
+const CLIENT_HEADER = "opencsg-magpie/0.1.7"
 const TIMEOUT_MS = 20_000
 const TOOL_TIMEOUT_MS = 45_000
 const OAUTH_TIMEOUT_MS = 10 * 60_000
@@ -381,7 +390,7 @@ function authMethod(type, label) {
   }
 }
 
-async function discoverAuthorizeURL(portal, callbackURL, signal) {
+async function discoverAuthorizeURL(portal, signal) {
   const login = new URL("/login", portal)
   try {
     const res = await fetch(login, {
@@ -395,27 +404,29 @@ async function discoverAuthorizeURL(portal, callbackURL, signal) {
     if (authorize.protocol !== "https:" && authorize.protocol !== "http:") {
       throw new Error("OpenCSG returned an invalid sign-in URL")
     }
-    authorize.searchParams.set("state", callbackURL)
+    // /login publishes state=casdoor, which only signs the browser into the
+    // portal. Ask the user service to send the sign-in to the local target.
+    authorize.searchParams.set("state", SIGNIN_STATE)
     return authorize.toString()
   } catch {
     return undefined
   }
 }
 
-function fallbackAuthorizeURL(callbackURL) {
+function fallbackAuthorizeURL() {
   const authorize = new URL(DEFAULT_IAM_AUTHORIZE)
   authorize.searchParams.set("client_id", DEFAULT_IAM_CLIENT_ID)
   authorize.searchParams.set("response_type", "code")
   authorize.searchParams.set("redirect_uri", DEFAULT_IAM_CALLBACK)
   authorize.searchParams.set("scope", "read")
-  authorize.searchParams.set("state", callbackURL)
+  authorize.searchParams.set("state", SIGNIN_STATE)
   return authorize.toString()
 }
 
-async function authorizeURL(portal, callbackURL, signal) {
-  const discovered = await discoverAuthorizeURL(portal, callbackURL, signal)
+async function authorizeURL(portal, signal) {
+  const discovered = await discoverAuthorizeURL(portal, signal)
   if (discovered) return discovered
-  if (portal === DEFAULT_PORTAL) return fallbackAuthorizeURL(callbackURL)
+  if (portal === DEFAULT_PORTAL) return fallbackAuthorizeURL()
   throw new Error("Could not start OpenCSG sign-in for this gateway")
 }
 
@@ -427,30 +438,49 @@ function callbackPage(ok) {
   return `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title></head><body><main><h1>${title}</h1><p>${message}</p></main></body></html>`
 }
 
-function localCallback(nonce, finish, done) {
+// signInCallbackURL is where the platform sends the signed JWT. It mirrors
+// OPENCSG_USER_SERVER_LITE_REDIRECT_URL, which defaults to a loopback target
+// reserved for local apps; a deployment that changed it can point the plugin
+// at the new value with OPENCSG_SIGNIN_CALLBACK.
+function signInCallbackURL() {
+  const configured = text(process.env.OPENCSG_SIGNIN_CALLBACK)
+  let url
+  try {
+    url = new URL(configured || DEFAULT_SIGNIN_CALLBACK)
+  } catch {
+    throw new Error("OPENCSG_SIGNIN_CALLBACK must be an absolute http URL")
+  }
+  if (url.protocol !== "http:") {
+    throw new Error("OPENCSG_SIGNIN_CALLBACK must use http; the platform's lite callback is loopback")
+  }
+  url.search = ""
+  url.hash = ""
+  return url
+}
+
+function localCallback(path, finish, done) {
   return (req, res) => {
     const url = new URL(req.url ?? "/", "http://127.0.0.1")
     res.setHeader("Cache-Control", "no-store")
     res.setHeader("Content-Type", "text/html; charset=utf-8")
 
-    if (req.method !== "GET" || url.pathname !== "/callback") {
+    if (req.method !== "GET" || url.pathname !== path) {
       res.statusCode = 404
       res.end(callbackPage(false))
       return
     }
-    if (url.searchParams.get("nonce") !== nonce) {
-      res.statusCode = 400
-      res.end(callbackPage(false))
-      return
-    }
 
-    const jwt = text(url.searchParams.get("jwt_token"))
+    // The lite target carries the signed CSGHub JWT as `jwt`; older or
+    // re-routed deployments may still call it `jwt_token`.
+    const jwt = text(url.searchParams.get("jwt")) || text(url.searchParams.get("jwt_token"))
     if (!jwt) {
+      const reason =
+        text(url.searchParams.get("error_message")) ||
+        text(url.searchParams.get("error")) ||
+        "OpenCSG did not return a sign-in token. Try again."
       res.statusCode = 400
       res.end(callbackPage(false))
-      if (!done()) {
-        finish({ error: new Error("OpenCSG did not return a sign-in token. Try again.") })
-      }
+      if (!done()) finish({ error: new Error(reason) })
       return
     }
 
@@ -461,22 +491,34 @@ function localCallback(nonce, finish, done) {
 }
 
 async function callbackServer() {
-  const nonce = randomUUID()
+  const callback = signInCallbackURL()
+  const port = callback.port ? Number(callback.port) : 80
   let finish
   let done = false
   const completion = new Promise((resolve) => {
     finish = resolve
   })
 
-  const server = createServer(localCallback(nonce, finish, () => {
-    if (done) return true
-    done = true
-    return false
-  }))
+  const server = createServer(
+    localCallback(callback.pathname, finish, () => {
+      if (done) return true
+      done = true
+      return false
+    }),
+  )
 
   await new Promise((resolve, reject) => {
-    server.once("error", reject)
-    server.listen(0, "127.0.0.1", resolve)
+    server.once("error", (error) => {
+      reject(
+        error?.code === "EADDRINUSE"
+          ? new Error(
+              `${callback.host} port ${port} is already in use. Stop the other local OpenCSG ` +
+                "sign-in listener (csghub-lite listens on the same target) and try again.",
+            )
+          : error,
+      )
+    })
+    server.listen(port, callback.hostname, resolve)
   })
   const address = server.address()
   if (!address || typeof address === "string") {
@@ -484,18 +526,22 @@ async function callbackServer() {
     throw new Error("Could not start the local OpenCSG sign-in listener")
   }
 
-  const callbackURL = new URL(`http://127.0.0.1:${address.port}/callback`)
-  callbackURL.searchParams.set("nonce", nonce)
   const timer = setTimeout(() => {
     if (done) return
     done = true
-    finish({ error: new Error("OpenCSG sign-in timed out. Try again.") })
+    finish({
+      error: new Error(
+        `OpenCSG sign-in timed out without reaching ${callback.href}. ` +
+          "The platform sends the lite callback to OPENCSG_USER_SERVER_LITE_REDIRECT_URL; " +
+          "set OPENCSG_SIGNIN_CALLBACK to that URL if the deployment changed it.",
+      ),
+    })
     server.close()
   }, OAUTH_TIMEOUT_MS)
   timer.unref?.()
 
   return {
-    callbackURL: callbackURL.toString(),
+    callbackURL: callback.toString(),
     completion,
     close() {
       clearTimeout(timer)
@@ -1327,7 +1373,7 @@ function openCodeOAuth() {
 
       let url
       try {
-        url = await authorizeURL(portalOf(gateway), session.callbackURL)
+        url = await authorizeURL(portalOf(gateway))
       } catch (e) {
         session.close()
         throw new Error(e.message)
@@ -1515,7 +1561,7 @@ export const OpenCSGAuthPlugin = async ({ client } = {}) => {
 
             let url
             try {
-              url = await authorizeURL(portalOf(gateway), session.callbackURL)
+              url = await authorizeURL(portalOf(gateway))
             } catch (e) {
               session.close()
               return { type: "failed", error: e.message }
@@ -1524,7 +1570,8 @@ export const OpenCSGAuthPlugin = async ({ client } = {}) => {
             return {
               url,
               instructions:
-                "Finish signing in to OpenCSG in your browser. magpie will fetch an AI Gateway key automatically.",
+                `Finish signing in to OpenCSG in your browser. magpie will fetch an AI Gateway key automatically. ` +
+                `The browser returns to ${session.callbackURL}.`,
               method: "auto",
               async callback() {
                 try {
@@ -1677,6 +1724,10 @@ export const _internal = {
   parseJWTPayload,
   keyFromPayload,
   authMethod,
+  SIGNIN_STATE,
+  DEFAULT_SIGNIN_CALLBACK,
+  signInCallbackURL,
+  validateKey,
   discoverAuthorizeURL,
   fallbackAuthorizeURL,
   authorizeURL,
