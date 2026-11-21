@@ -218,6 +218,20 @@ The plugin asks the CSGHub deployment that serves the gateway for:
 - `GET /api/v1/accounting/token-plans/{namespace-uuid}/get` - the current
   token-plan subscription with its latest billing period.
 
+CSGHub v2.8.2 and later accept an AI Gateway key (`gk_…`) only on the
+inference routes; the portal answers `AUTH-ERR-5` to it everywhere else. Those
+two reads therefore authenticate with the account's own CSGHub access token
+instead. The platform already creates that token during sign-in: the lite
+callback returns it as `token` (the token the user service creates or reuses
+as `csglite`), and the plugin stores it in the account's metadata. Nothing is
+created by the plugin, and the user never pastes a second credential. The
+token is visible and revocable in the portal's access-token settings.
+
+An account added by pasting a Gateway key has no signed-in session, so it has
+no access token either. On v2.8.2 and later such an account shows no plan or
+balance; on earlier deployments it still reads them with the Gateway key. Sign
+in with OpenCSG to get the allowance back.
+
 CSGHub keeps money in 分 (cents). Every amount is converted to 元 the way
 csghub-portal does it (`amount / 100`), so a stored `550984.7` is shown as
 `¥5,509.85`, and cash and bonus credit are listed beside it.

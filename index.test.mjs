@@ -145,7 +145,7 @@ describe("OAuth", () => {
     const second = await _internal.callbackServer()
     const good = await fetch(`${second.callbackURL}?token=csghub-token&jwt=${token}`)
     expect(good.status).toBe(200)
-    await expect(second.completion).resolves.toEqual({ jwt: token })
+    await expect(second.completion).resolves.toEqual({ jwt: token, accessToken: "csghub-token" })
     second.close()
   })
 
@@ -184,6 +184,7 @@ describe("OAuth", () => {
       "https://opencsg.com/api/v1/user/alice/tokens/first?app=aigateway&token_name=magpie",
     )
   })
+
 })
 
 describe("readModels", () => {
@@ -358,6 +359,29 @@ describe("account usage", () => {
       "/api/v1/accounting/token-plans/user-1/get",
     ])
     for (const call of calls) expect(call.headers.get("authorization")).toBe("Bearer gk-test")
+  })
+
+  test("reads the allowance with the access token sign-in stored", async () => {
+    const calls = []
+    globalThis.fetch = async (input, init) => {
+      const url = new URL(input)
+      calls.push({ path: url.pathname, headers: new Headers(init.headers) })
+      if (url.pathname === "/api/v1/token/usage-token") return Response.json({ msg: "OK", data: account })
+      if (url.pathname === "/api/v1/accounting/credit/user-1/balance")
+        return Response.json(balance(12345))
+      return new Response("not found", { status: 404 })
+    }
+
+    const usage = await _internal.accountUsage(auth({ usageToken: "usage-token" }))
+
+    expect(usage.user).toBe("alice")
+    expect(usage.balance).toBe("¥123.45")
+    expect(calls.map((call) => call.path)).toEqual([
+      "/api/v1/token/usage-token",
+      "/api/v1/accounting/credit/user-1/balance",
+      "/api/v1/accounting/token-plans/user-1/get",
+    ])
+    for (const call of calls) expect(call.headers.get("authorization")).toBe("Bearer usage-token")
   })
 
   test("keeps a private deployment without accounting from failing", async () => {
@@ -935,6 +959,38 @@ describe("plugin hooks", () => {
     const failed = await authorization.callback()
     expect(failed.type).toBe("failed")
     expect(failed.error).toContain("did not return a sign-in token")
+    authorization.close()
+  })
+
+  test("stores the access token the sign-in callback carries", async () => {
+    const hooks = await load(undefined)
+    const methods = hooks.auth.methods
+    const token = jwt({ current_user: "alice", uuid: "user-uuid" })
+    const localFetch = globalThis.fetch
+    globalThis.fetch = async (input, init) => {
+      const url = String(input)
+      if (url === "https://opencsg.com/login") {
+        return new Response(null, {
+          status: 303,
+          headers: { location: "https://iam.opencsg.com/login/oauth/authorize?client_id=client" },
+        })
+      }
+      if (url.startsWith("http://127.0.0.1:")) return localFetch(input, init)
+      if (url === "https://opencsg.com/api/v1/namespaces/user-uuid/apikeys/builtin")
+        return Response.json({ msg: "OK", data: { token: "gk-builtin" } })
+      if (url === "https://opencsg.com/aigateway/v1/models?page=1&per=100")
+        return Response.json({ object: "list", data: [] })
+      throw new Error(`unexpected request ${url}`)
+    }
+
+    const authorization = await methods[1].authorize({ baseURL: "" })
+    await fetch(`${_internal.DEFAULT_SIGNIN_CALLBACK}?jwt=${token}&token=csglite-token`)
+    const success = await authorization.callback()
+
+    expect(success.type).toBe("success")
+    expect(success.key).toBe("gk-builtin")
+    expect(success.metadata.usageToken).toBe("csglite-token")
+    expect(success.metadata.username).toBe("alice")
     authorization.close()
   })
 

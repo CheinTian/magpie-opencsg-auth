@@ -16,7 +16,8 @@ const DEFAULT_IAM_CALLBACK = "https://opencsg.com/api/v1/callback/casdoor"
 // OpenCSG's portal OAuth callback forwards the signed JWT to one of three
 // places: the portal itself (`state=casdoor`), a flow callback registered in
 // OPENCSG_USER_SERVER_FLOW_REDIRECTS (`state=<https URL>`), or the built-in
-// "lite" target (`state=lite` → OPENCSG_USER_SERVER_LITE_REDIRECT_URL).
+// "lite" target (`state=lite` → OPENCSG_USER_SERVER_LITE_REDIRECT_URL). The
+// lite target also carries the account's CSGHub access token as `token`.
 // A bare localhost URL in `state` matches none of them, so CSGHub answers
 // with opencsg.com/errors/server-error?error_code=500 - the 500 this plugin
 // used to hit. An app that cannot be registered on the platform must
@@ -471,8 +472,12 @@ function localCallback(path, finish, done) {
     }
 
     // The lite target carries the signed CSGHub JWT as `jwt`; older or
-    // re-routed deployments may still call it `jwt_token`.
+    // re-routed deployments may still call it `jwt_token`. It also carries the
+    // account's CSGHub access token as `token` - the credential the portal
+    // still accepts for accounting reads once a Gateway key no longer works
+    // outside the inference routes.
     const jwt = text(url.searchParams.get("jwt")) || text(url.searchParams.get("jwt_token"))
+    const accessToken = text(url.searchParams.get("token"))
     if (!jwt) {
       const reason =
         text(url.searchParams.get("error_message")) ||
@@ -486,7 +491,7 @@ function localCallback(path, finish, done) {
 
     res.statusCode = 200
     res.end(callbackPage(true))
-    if (!done()) finish({ jwt })
+    if (!done()) finish({ jwt, accessToken })
   }
 }
 
@@ -609,6 +614,14 @@ async function readModels(base, key, signal) {
 // private deployment may not run, and which says nothing about a person without
 // a subscription. Every read here must therefore answer "nothing to show"
 // rather than fail the account.
+//
+// CSGHub v2.8.2 keeps AI Gateway keys on the inference routes, so the portal
+// answers AUTH-ERR-5 to a `gk_` key on every /api/v1 route. Plan and balance
+// therefore authenticate with the account's own CSGHub access token, which the
+// platform's lite sign-in already hands back in the callback (`token`, the
+// token it creates or reuses as `csglite`); the plugin stores it beside the
+// key. Accounts added by pasting a key have none and keep the key as a last
+// resort for deployments before v2.8.2.
 
 const USAGE_TTL_MS = 60_000
 // magpie gives a usage read 20 seconds; the identity read and the two account
@@ -727,7 +740,10 @@ async function accountUsage(getAuth, signal) {
   const auth = await getAuth()
   if (!signedIn(auth)) return {}
   const portal = portalOf(gatewayOf(auth))
-  const key = auth.key
+  // The access token sign-in stored is the only credential the portal still
+  // takes for accounting reads; an account added by pasting a Gateway key has
+  // none, and keeps the old key as a last resort for deployments before v2.8.2.
+  const key = text(auth?.metadata?.usageToken) || auth.key
   const cacheKey = `${portal}\n${key}`
   const cached = usageCache.get(cacheKey)
   if (cached && Date.now() - cached.at < USAGE_TTL_MS) return cached.value
@@ -1747,6 +1763,7 @@ export const OpenCSGAuthPlugin = async ({ client } = {}) => {
                   if (result.error) throw result.error
                   const { key, claims } = await keyForJWT(result.jwt, gateway)
                   await validateKey(gateway, key)
+                  const usageToken = text(result.accessToken)
                   return {
                     type: "success",
                     key,
@@ -1755,6 +1772,7 @@ export const OpenCSGAuthPlugin = async ({ client } = {}) => {
                       systemOneURL:
                         systemOne === protocolEndpoints(gateway).decide ? "" : systemOne,
                       ...(protocol ? { protocol } : {}),
+                      ...(usageToken ? { usageToken } : {}),
                       username: claims.username,
                       uuid: claims.uuid,
                     },
